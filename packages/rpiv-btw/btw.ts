@@ -20,7 +20,7 @@ import {
 import { type CappedHistory, capHistory, type FitBranchResult, fitBranch } from "./btw-budget.js";
 import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
 import { showBtwOverlay } from "./btw-ui.js";
-import { loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
+import { getRuntimeCompleteSimple, loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
 
 // ---------------------------------------------------------------------------
 // Constants — flat named consts, grouped by concern (advisor pattern, b9428e9)
@@ -274,7 +274,8 @@ export async function executeBtw(
 	let built = buildBtwMessages(ctx, userMessage);
 
 	try {
-		const completeSimple = await loadCompleteSimple();
+		const runtimeCompleteSimple = getRuntimeCompleteSimple(ctx.modelRegistry);
+		const completeSimple = runtimeCompleteSimple ?? (await loadCompleteSimple());
 		const overflowFn = await loadIsContextOverflow();
 		let retried = false;
 		const callCompleteSimple = async (
@@ -283,11 +284,14 @@ export async function executeBtw(
 			const response = await completeSimple(
 				model,
 				{ systemPrompt: built.systemPrompt, messages: built.messages, tools: [] },
-				{
-					apiKey: auth.apiKey,
-					headers: auth.headers,
-					signal: controller.signal, // own AbortController, NOT ctx.signal (Decision 8)
-				},
+				// Runtime auth must resolve its own key/headers/baseUrl; explicit overrides bypass it.
+				runtimeCompleteSimple
+					? { signal: controller.signal }
+					: {
+							apiKey: auth.apiKey,
+							headers: auth.headers,
+							signal: controller.signal, // own AbortController, NOT ctx.signal (Decision 8)
+						},
 			);
 			if (response.stopReason === "aborted") {
 				return { kind: "aborted", stopReason: response.stopReason };

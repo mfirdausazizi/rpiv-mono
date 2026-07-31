@@ -30,6 +30,7 @@ vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
 // keep working; loadIsContextOverflow defaults to undefined (legacy host, no
 // retry) and is overridden per-test in the overflow-retry suite.
 vi.mock("./pi-compat.js", () => ({
+	getRuntimeCompleteSimple: vi.fn(),
 	loadCompleteSimple: vi.fn(),
 	loadIsContextOverflow: vi.fn(),
 }));
@@ -51,7 +52,7 @@ import {
 	registerMessageEndSnapshot,
 	userMessageText,
 } from "./btw.js";
-import { loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
+import { getRuntimeCompleteSimple, loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
 
 // Pins the substring `isStaleCtxError` matches in pi-core's invalidated-proxy error.
 const STALE_CTX_MESSAGE = "This extension ctx is stale after session replacement or reload.";
@@ -72,11 +73,13 @@ function makeCompletionResponse(input: {
 
 beforeEach(() => {
 	vi.mocked(completeSimple).mockReset();
+	vi.mocked(getRuntimeCompleteSimple).mockReset();
 	vi.mocked(loadCompleteSimple).mockReset();
 	vi.mocked(loadIsContextOverflow).mockReset();
 	// Route the loader to the shared completeSimple spy so existing
 	// mockResolvedValueOnce(makeCompletionResponse(...)) chains keep working.
 	vi.mocked(loadCompleteSimple).mockResolvedValue(completeSimple as never);
+	vi.mocked(getRuntimeCompleteSimple).mockReturnValue(undefined);
 	// Default: legacy host (isContextOverflow absent) → no retry. Per-test
 	// overrides set a real overflowFn to exercise the gate.
 	vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
@@ -176,6 +179,22 @@ describe("executeBtw — ok path", () => {
 		expect(r.answer).toBe("answer text");
 		expect(r.userMessage.content).toEqual([{ type: "text", text: "question" }]);
 		expect(r.assistantMessage).toBeDefined();
+	});
+
+	it("uses Pi's auth-aware runtime for custom providers", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "custom", id: "m", api: "custom-responses" } as never;
+		const runtimeCompleteSimple = vi.fn(async () => makeCompletionResponse({ text: "custom answer" }));
+		vi.mocked(getRuntimeCompleteSimple).mockReturnValue(runtimeCompleteSimple as never);
+		const controller = new AbortController();
+
+		const result = await executeBtw("question", ctx, controller);
+
+		expect(result).toMatchObject({ kind: "success", answer: "custom answer" });
+		expect(runtimeCompleteSimple).toHaveBeenCalledWith(ctx.model, expect.objectContaining({ tools: [] }), {
+			signal: controller.signal,
+		});
+		expect(completeSimple).not.toHaveBeenCalled();
 	});
 });
 

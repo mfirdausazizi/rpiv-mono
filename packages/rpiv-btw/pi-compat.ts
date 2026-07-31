@@ -1,23 +1,37 @@
 /**
- * Host-version-tolerant loader for pi-ai's `completeSimple`.
+ * Host-version-tolerant completion helpers.
  *
- * Pi >= 0.80.1 moved the global dispatch API (`completeSimple` et al.) to the
- * "@earendil-works/pi-ai/compat" entrypoint; hosts <= 0.79.x export it from
- * the package root and have no /compat entrypoint at all. pi-ai resolves at
- * runtime against the HOST's copy (peerDependency "*"), so neither path can
- * be a static import — try /compat first, fall back to the root entrypoint.
+ * Prefer Pi's auth-aware ModelRuntime facade when available. It dispatches
+ * extension-registered providers and applies credential-derived request fields.
+ * Older hosts fall back to pi-ai's global `completeSimple`: Pi >= 0.80.1 exports
+ * it from "@earendil-works/pi-ai/compat"; hosts <= 0.79.x export it from the
+ * package root. The imports stay dynamic so they resolve against the host copy.
  *
- * The fallback is reserved for RESOLUTION failures (the /compat subpath does
- * not exist on this host); any other /compat error — the entrypoint exists but
- * throws at module init — rethrows so the real failure surfaces at the call
- * site instead of being masked by a root import that may lack the export.
- *
- * /compat is documented as temporary (deleted with pi's ModelManager
- * migration); when that lands, this module is the single place to migrate.
+ * The root fallback is reserved for resolution failures. Any other /compat
+ * initialization error is rethrown so the real failure is not masked.
  */
 
 type CompleteSimpleFn = typeof import("@earendil-works/pi-ai/compat").completeSimple;
 type IsContextOverflowFn = typeof import("@earendil-works/pi-ai/compat").isContextOverflow;
+
+/**
+ * Resolve Pi's auth-aware completion facade when the host exposes one.
+ *
+ * Do not pass preflight apiKey/headers to this path: the runtime applies OAuth
+ * credentials and credential-derived fields such as provider-specific baseUrl.
+ * Older or future hosts with a different private shape use the legacy fallback.
+ */
+export function getRuntimeCompleteSimple(modelRegistry: unknown): CompleteSimpleFn | undefined {
+	try {
+		if (modelRegistry === null || typeof modelRegistry !== "object") return undefined;
+		const runtime = (modelRegistry as { runtime?: unknown }).runtime;
+		if (runtime === null || typeof runtime !== "object") return undefined;
+		const completeSimple = (runtime as { completeSimple?: unknown }).completeSimple;
+		return typeof completeSimple === "function" ? (completeSimple.bind(runtime) as CompleteSimpleFn) : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Error codes meaning "the /compat entrypoint is not resolvable on this host":

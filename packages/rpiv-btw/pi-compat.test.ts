@@ -1,14 +1,27 @@
-/**
- * pi-compat tests — the host-version-tolerant `completeSimple` loader.
- *
- * The consumer test files mock `@earendil-works/pi-ai/compat` to SUCCEED, so
- * the version-tolerance arms the shim exists for are exercised here instead:
- * /compat resolves (host >= 0.80.1), /compat unresolvable → root fallback
- * (host <= 0.79.x), a REAL /compat failure rethrows instead of masking, and a
- * host with neither export fails with a clear error.
- */
+/** Tests for the auth-aware runtime bridge and legacy completeSimple loader. */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getRuntimeCompleteSimple } from "./pi-compat.js";
+
+describe("getRuntimeCompleteSimple", () => {
+	it("binds the host runtime completion facade", () => {
+		const runtime = {
+			marker: "runtime",
+			completeSimple(this: { marker: string }) {
+				return this.marker;
+			},
+		};
+		const completeSimple = getRuntimeCompleteSimple({ runtime });
+
+		expect((completeSimple as unknown as () => string)()).toBe("runtime");
+	});
+
+	it("returns undefined when the host runtime facade is absent or malformed", () => {
+		for (const registry of [undefined, {}, { runtime: null }, { runtime: { completeSimple: "nope" } }]) {
+			expect(getRuntimeCompleteSimple(registry)).toBeUndefined();
+		}
+	});
+});
 
 describe("loadCompleteSimple", () => {
 	afterEach(() => {
