@@ -26,7 +26,14 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { parseModelKey } from "@juicesharp/rpiv-config";
-import { BTW_CONTEXT_RESERVE, type CappedHistory, capHistory, type FitBranchResult, fitBranch } from "./btw-budget.js";
+import {
+	BTW_CONTEXT_RESERVE,
+	type CappedHistory,
+	capHistory,
+	estimatePromptTokens,
+	type FitBranchResult,
+	fitBranch,
+} from "./btw-budget.js";
 import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
 import { type BtwPopupSubmitResult, showBtwPopup } from "./btw-ui.js";
 import { type BtwEffort, loadBtwConfig } from "./config.js";
@@ -61,19 +68,63 @@ const errNoApiKey = (label: string) => `/btw model (${label}) has no API key ava
 const errCallFailed = (err: string | undefined) => `/btw call failed: ${err ?? "unknown error"}`;
 const errCallThrew = (msg: string) => `/btw call threw: ${msg}`;
 
-function parsePromptLimit(message: string | undefined): number | undefined {
-	const match = message?.match(/maximum prompt length is\s+([\d,]+)/i);
-	if (!match) return undefined;
-	const limit = Number(match[1]!.replaceAll(",", ""));
-	return Number.isSafeInteger(limit) && limit > 0 ? limit : undefined;
+/**
+ * Numbers a provider reports when it rejects an oversized prompt, e.g.
+ * "This model's maximum prompt length is 500000 but the request contains 523992 tokens."
+ *
+ * `actual` matters as much as `limit`: it is the provider's own count of the
+ * request we just sent, which is the only ground truth we get for how far our
+ * chars/4 estimate diverges from their tokenizer. Scaling by limit alone lets an
+ * undercounting estimate overflow a second time.
+ */
+interface PromptOverflow {
+	limit: number;
+	actual?: number;
+}
+
+function parseCount(raw: string | undefined): number | undefined {
+	if (raw === undefined) return undefined;
+	const value = Number(raw.replaceAll(",", ""));
+	return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function parsePromptOverflow(message: string | undefined): PromptOverflow | undefined {
+	const limit = parseCount(message?.match(/maximum prompt length is\s+([\d,]+)/i)?.[1]);
+	if (limit === undefined) return undefined;
+	const actual = parseCount(message?.match(/request contains\s+([\d,]+)/i)?.[1]);
+	return { limit, actual };
+}
+
+function safePromptLimit(reportedLimit: number): number {
+	return Math.floor(reportedLimit * 0.9);
 }
 
 function modelForPromptLimit(model: Model<Api>, reportedLimit: number): Model<Api> {
-	const safePromptLimit = Math.floor(reportedLimit * 0.9);
 	return {
 		...model,
-		contextWindow: safePromptLimit + (model.maxTokens ?? 0) + BTW_CONTEXT_RESERVE,
+		contextWindow: safePromptLimit(reportedLimit) + (model.maxTokens ?? 0) + BTW_CONTEXT_RESERVE,
 	};
+}
+
+/**
+ * Branch budget for the retry, expressed in OUR estimate's units.
+ *
+ * The provider's `actual` is their tokenizer's count of the exact prompt they just
+ * rejected, and `estimatePromptTokens` is our chars/4 count of that same prompt, so
+ * their ratio measures how far our heuristic diverges. Scaling the safe limit by it
+ * converts "450k provider tokens" into the budget our own accounting has to target.
+ *
+ * Scaling `keepBudget` directly does not work: it is derived from the model's
+ * advertised window, so when a provider advertises 2M but enforces 500k, a shrunken
+ * budget can still sit above our branch estimate, the branch keeps "fitting", and the
+ * retry resends a byte-identical request.
+ */
+function retryKeepBudget(built: BtwBuiltContext, overflow: PromptOverflow): number | undefined {
+	if (overflow.actual === undefined || overflow.actual <= overflow.limit) return undefined;
+	const ourEstimate = estimatePromptTokens(built.systemPrompt, built.messages);
+	if (ourEstimate <= 0) return undefined;
+	const safeWholePrompt = Math.floor(safePromptLimit(overflow.limit) * (ourEstimate / overflow.actual));
+	return Math.max(0, safeWholePrompt - built.nonBranchEstimate);
 }
 
 // Budget (context-budgeting) constants — defined in btw-budget.ts (the leaf budget
@@ -230,6 +281,8 @@ function readBranchSnapshot(ctx: ExtensionContext): { messages: Message[]; entri
 export interface BtwBuiltContext {
 	messages: Message[];
 	systemPrompt: string;
+	/** Estimated system + admitted BTW history + current question tokens (everything except the branch). */
+	nonBranchEstimate: number;
 	droppedTurns: number;
 	branchWasTrimmed: boolean;
 	stubbed: boolean;
@@ -271,14 +324,12 @@ export function buildBtwMessages(
 		capped = capHistory(history);
 		fit = fitBranch({ ...fitInput, admittedEstimate: capped.estimate, keepBudget });
 	}
-	const assembled: Message[] = [
-		...fit.messages,
-		...capped.admitted.flatMap((t) => [t.userMessage, t.assistantMessage]),
-		userMessage,
-	];
+	const nonBranchMessages = [...capped.admitted.flatMap((t) => [t.userMessage, t.assistantMessage]), userMessage];
+	const assembled: Message[] = [...fit.messages, ...nonBranchMessages];
 	return {
 		messages: assembled,
 		systemPrompt,
+		nonBranchEstimate: estimatePromptTokens(systemPrompt, nonBranchMessages),
 		droppedTurns: capped.droppedTurns,
 		branchWasTrimmed: fit.branchWasTrimmed,
 		stubbed: fit.stubbed,
@@ -353,16 +404,17 @@ export async function executeBtw(
 		let response = outcome.response;
 		// Overflow gate — exactly one retry. Provider-reported prompt caps take
 		// precedence; otherwise retain the legacy half-budget fallback.
-		const reportedPromptLimit = response.stopReason === "error" ? parsePromptLimit(response.errorMessage) : undefined;
+		const overflowReport = response.stopReason === "error" ? parsePromptOverflow(response.errorMessage) : undefined;
 		const overflow =
-			reportedPromptLimit !== undefined ||
+			overflowReport !== undefined ||
 			(response.stopReason === "error" && Boolean(overflowFn?.(response, model.contextWindow)));
 		if (overflow) {
-			const retryModel = reportedPromptLimit === undefined ? model : modelForPromptLimit(model, reportedPromptLimit);
-			built =
-				reportedPromptLimit === undefined
-					? buildBtwMessages(ctx, userMessage, Math.floor(built.keepBudget / 2), retryModel)
-					: buildBtwMessages(ctx, userMessage, undefined, retryModel);
+			const retryModel = overflowReport === undefined ? model : modelForPromptLimit(model, overflowReport.limit);
+			// Prefer the provider's own token count; fall back to its cap alone, then to
+			// halving when the host only tells us "too long" without any numbers.
+			const keepBudget =
+				overflowReport === undefined ? Math.floor(built.keepBudget / 2) : retryKeepBudget(built, overflowReport);
+			built = buildBtwMessages(ctx, userMessage, keepBudget, retryModel);
 			outcome = await callCompleteSimple(built, retryModel);
 			if (outcome.kind === "aborted") return outcome;
 			response = outcome.response;

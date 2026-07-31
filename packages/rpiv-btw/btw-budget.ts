@@ -153,6 +153,19 @@ function estimateMessagesTokens(messages: Message[]): number {
 	return sum;
 }
 
+/**
+ * Our chars/4 estimate of a whole outgoing prompt (system + messages), in the same
+ * scope a provider means by "the request contains N tokens".
+ *
+ * The overflow-retry caller compares this against the provider's reported count to
+ * measure how far our heuristic diverges from their tokenizer, then shrinks the
+ * window by that factor. Without it, a prompt we estimate at 600k but the provider
+ * counts at 1.05M keeps "fitting" our budget and the retry resends it unchanged.
+ */
+export function estimatePromptTokens(systemPrompt: string, messages: Message[]): number {
+	return estimateTextTokens(systemPrompt) + estimateMessagesTokens(messages);
+}
+
 /** Branch-usage estimate. Anchor = getLastAssistantUsage → calculateContextTokens
  *  (safe overcount: includes the main agent's system/tools that /btw omits) PLUS
  *  estimateTokens over every context message from entries AFTER the anchor — turns the

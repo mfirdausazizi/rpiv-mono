@@ -50,7 +50,7 @@ not written to disk.
 - **Follow-up context** — only successful turns are added to process-scoped BTW history, exactly once.
 - **Safe cancellation** — Escape aborts only the active BTW request.
 - **Compaction-safe context** — branch snapshots are invalidated after compaction or tree changes, but `/btw` never triggers or mutates main-session compaction.
-- **Provider-cap recovery** — a numeric provider prompt limit is parsed, a 10%-safe temporary context window is rebuilt, and exactly one retry is attempted. Unrecognized host-reported overflow retains the conservative half-budget fallback.
+- **Provider-cap recovery** — a numeric provider prompt limit is parsed, a 10%-safe temporary context window is rebuilt, and exactly one retry is attempted. When the provider also reports its own token count, that count calibrates the retry against `/btw`'s internal estimate so the rebuilt request actually shrinks. Unrecognized host-reported overflow retains the conservative half-budget fallback.
 - **No tools** — side calls always use `tools: []`.
 
 ## Reference

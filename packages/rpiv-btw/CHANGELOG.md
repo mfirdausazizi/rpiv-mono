@@ -10,7 +10,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `/btw` now opens a centered persistent chat popup. Empty `/btw` opens a focused input; `/btw <question>` submits immediately; follow-ups use Enter, Markdown answers, PageUp/PageDown scrolling, Ctrl+L clearing, and Escape cancellation.
 - Popup history remains process-scoped, only successful turns are persisted in memory, and no side answer enters the main transcript or triggers main-session compaction.
-- Provider-reported numeric prompt caps now drive one 10%-safe retry; unrecognized host overflow retains the conservative half-budget fallback.
+- Provider-reported numeric prompt caps now drive one 10%-safe retry. When the provider also reports its own token count, that count calibrates the retry against `/btw`'s internal chars/4 estimate so the rebuilt request actually shrinks instead of being resent unchanged. Unrecognized host overflow retains the conservative half-budget fallback.
+- The popup's height now follows its content up to a terminal cap, so a short answer draws a short popup instead of an empty full-height frame.
 - `/btw-settings` persists a global model and reasoning-level override, with a “Follow current session” option that uses the active session model and reasoning level. Configured extension providers continue through Pi's auth-aware model runtime, and unavailable configured models fail explicitly instead of silently falling back.
 - The `/btw-settings` model picker is searchable and limits choices to the current session's scoped models when a scope is configured.
 

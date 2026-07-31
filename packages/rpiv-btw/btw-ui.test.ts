@@ -177,6 +177,17 @@ describe("BtwPopupController viewport", () => {
 		expect(ctl.render(100).join("\n")).toContain("answer-11");
 	});
 
+	it("renders a short popup for short content and grows to the terminal cap for long content", () => {
+		const short = makeController({ rows: 24 });
+		const long = makeController({
+			rows: 24,
+			history: Array.from({ length: 20 }, (_, i) => makeTurn(`question-${i}`, `answer-${i}`)),
+		});
+
+		expect(short.ctl.render(80).length).toBe(8); // 3 minimum transcript rows + 5 chrome rows
+		expect(long.ctl.render(80).length).toBe(19); // 80% of 24 rows, rounded down
+	});
+
 	it("forwards arrow keys to Input instead of scrolling", () => {
 		const input = vi.spyOn(Input.prototype, "handleInput");
 		const { ctl } = makeController({ history: [makeTurn("old")] });
@@ -215,7 +226,7 @@ describe("showBtwPopup", () => {
 		expect(component).toBeInstanceOf(BtwPopupController);
 		expect((custom as any).options).toMatchObject({
 			overlay: true,
-			overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%", margin: 1 },
+			overlayOptions: { anchor: "center", width: "75%", maxHeight: "80%", margin: 1 },
 		});
 	});
 });

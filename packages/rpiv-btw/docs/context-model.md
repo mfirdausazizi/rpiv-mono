@@ -45,11 +45,20 @@ such as:
 
 `/btw` parses the numeric cap, applies a 10% safety margin, creates a temporary
 model copy whose context window targets that prompt limit, rebuilds from the
-unchanged snapshot/history, and retries exactly once. When no numeric cap is
-available but the host recognizes context overflow, the existing conservative
-half-budget fallback is used. A second overflow is returned as an error; there
-is no third call. A successful response is never retried merely because it has
-an `errorMessage` field.
+unchanged snapshot/history, and retries exactly once.
+
+When the error also reports its own token count (`the request contains 1047984
+tokens`), that count is the provider tokenizer's measurement of the exact prompt
+that was just rejected. `/btw` compares it against its own chars/4 estimate of the
+same prompt and scales the branch budget by the difference. This matters because a
+provider may advertise a 2M window while enforcing 500k: scaling only the advertised
+window can leave a budget that still sits above the internal estimate, so the branch
+keeps "fitting", nothing is trimmed, and the retry resends a byte-identical request.
+
+When no numeric cap is available but the host recognizes context overflow, the
+existing conservative half-budget fallback is used. A second overflow is returned as
+an error; there is no third call. A successful response is never retried merely
+because it has an `errorMessage` field.
 
 ## BTW history
 

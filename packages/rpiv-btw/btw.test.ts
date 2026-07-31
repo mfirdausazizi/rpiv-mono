@@ -484,6 +484,81 @@ describe("executeBtw — overflow retry", () => {
 		expect((calls[1][0] as { contextWindow: number }).contextWindow).toBe(594_384);
 	});
 
+	it("scales the retry by the provider's reported token count, not our own estimate", async () => {
+		// The provider counts 1047984 tokens for a prompt our chars/4 heuristic scores at
+		// ~600k. Scaling only the advertised window leaves the branch "fitting" our budget,
+		// so the retry would resend a byte-identical request; the reported count is what
+		// forces a real trim.
+		const branchText = "x".repeat(2_400_000);
+		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage(branchText)]) });
+		ctx.model = { provider: "a", id: "m", contextWindow: 2_000_000, maxTokens: 128_000 } as never;
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
+		vi.mocked(completeSimple)
+			.mockResolvedValueOnce(
+				makeCompletionResponse({
+					stopReason: "error",
+					errorMessage: "This model's maximum prompt length is 500000 but the request contains 1047984 tokens.",
+				}) as never,
+			)
+			.mockResolvedValueOnce(makeCompletionResponse({ text: "retry answer" }) as never);
+
+		const result = await executeBtw("q", ctx, new AbortController());
+
+		expect(result.kind).toBe("success");
+		const calls = vi.mocked(completeSimple).mock.calls as Array<[unknown, { messages: unknown[] }, unknown]>;
+		const sent = JSON.stringify(calls[1][1].messages).length;
+		// 1047984 reported vs a 450k safe limit is a ~2.33x overcount, so the retry must
+		// land well under half the original — not merely "smaller".
+		expect(sent).toBeLessThan(JSON.stringify(calls[0][1].messages).length / 2);
+	});
+
+	it("subtracts system, history, and question overhead from the calibrated branch budget", async () => {
+		const branchText = "b".repeat(2_400_000);
+		const question = "q".repeat(160_000);
+		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage(branchText)]) });
+		ctx.model = { provider: "a", id: "m", contextWindow: 2_000_000, maxTokens: 128_000 } as never;
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
+		vi.mocked(completeSimple)
+			.mockResolvedValueOnce(
+				makeCompletionResponse({
+					stopReason: "error",
+					errorMessage: "This model's maximum prompt length is 500000 but the request contains 1100000 tokens.",
+				}) as never,
+			)
+			.mockResolvedValueOnce(makeCompletionResponse({ text: "retry answer" }) as never);
+
+		const result = await executeBtw(question, ctx, new AbortController());
+
+		expect(result.kind).toBe("success");
+		const calls = vi.mocked(completeSimple).mock.calls as Array<[unknown, { messages: unknown[] }, unknown]>;
+		// The whole retried prompt targets ~1.05M chars under our estimator. If the
+		// 160k-char question were not subtracted from the branch allowance, this would
+		// be roughly 1.2M chars instead.
+		expect(JSON.stringify(calls[1][1].messages).length).toBeLessThan(1_100_000);
+	});
+
+	it("still retries on a numeric cap with no reported token count", async () => {
+		const branchText = "z".repeat(2_400_000);
+		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage(branchText)]) });
+		ctx.model = { provider: "a", id: "m", contextWindow: 2_000_000, maxTokens: 128_000 } as never;
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
+		vi.mocked(completeSimple)
+			.mockResolvedValueOnce(
+				makeCompletionResponse({
+					stopReason: "error",
+					errorMessage: "This model's maximum prompt length is 500000.",
+				}) as never,
+			)
+			.mockResolvedValueOnce(makeCompletionResponse({ text: "retry answer" }) as never);
+
+		const result = await executeBtw("q", ctx, new AbortController());
+
+		expect(result.kind).toBe("success");
+		expect(completeSimple).toHaveBeenCalledTimes(2);
+		const calls = vi.mocked(completeSimple).mock.calls as Array<[unknown, { messages: unknown[] }, unknown]>;
+		expect(JSON.stringify(calls[1][1].messages).length).toBeLessThan(JSON.stringify(calls[0][1].messages).length);
+	});
+
 	it("does not retry a successful response that happens to include an error message", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;

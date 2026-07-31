@@ -13,10 +13,13 @@ import {
 } from "@earendil-works/pi-tui";
 import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
 
-const POPUP_WIDTH = "90%";
-const POPUP_MAX_HEIGHT = "90%";
+const POPUP_WIDTH = "75%";
+const POPUP_MAX_HEIGHT = "80%";
 const POPUP_PADDING = 1;
-const MIN_POPUP_ROWS = 8;
+// Non-transcript rows the frame always draws: top border (carries the title),
+// divider, input, footer, bottom border.
+const POPUP_CHROME_ROWS = 5;
+const MIN_VIEWPORT_ROWS = 3;
 const FOOTER_TEXT = "Enter send · PgUp/PgDn scroll · Ctrl+L clear · Esc close";
 const PENDING_TEXT = "… waiting for answer";
 const TRIMMED_TEXT = "context trimmed to fit budget";
@@ -123,26 +126,23 @@ export class BtwPopupController implements Component, Focusable {
 		const frameWidth = this.lastWidth;
 		const innerWidth = Math.max(10, frameWidth - 2);
 		const bodyWidth = Math.max(10, innerWidth - POPUP_PADDING * 2);
-		const maxRows = Math.max(MIN_POPUP_ROWS, Math.floor(this.terminalRows() * 0.9));
-		const viewportRows = Math.max(1, maxRows - 7);
 		const transcript = this.renderTranscript(bodyWidth);
+		// Height follows the transcript: the popup only grows to the terminal cap when
+		// there is that much content to show, so a short answer draws a short popup.
+		const viewportRows = Math.min(Math.max(transcript.length, MIN_VIEWPORT_ROWS), this.maxViewportRows());
 		const maxScroll = Math.max(0, transcript.length - viewportRows);
 		this.scrollFromBottom = Math.min(this.scrollFromBottom, maxScroll);
 		const end = transcript.length - this.scrollFromBottom;
 		const start = Math.max(0, end - viewportRows);
 		const visible = transcript.slice(start, end);
-		while (visible.length < viewportRows) visible.unshift("");
+		while (visible.length < MIN_VIEWPORT_ROWS) visible.push("");
 
 		const lines = [
 			this.topBorder(frameWidth),
-			this.boxRow("", bodyWidth),
-			this.boxRow(this.headerText(bodyWidth), bodyWidth),
-			this.boxRow("", bodyWidth),
 			...visible.map((line) => this.boxRow(line, bodyWidth)),
 			this.divider(innerWidth),
 			this.boxRow(`> ${this.input.render(Math.max(1, bodyWidth - 2)).join("")}`, bodyWidth),
 			this.boxRow(this.theme.fg("dim", FOOTER_TEXT), bodyWidth),
-			this.boxRow("", bodyWidth),
 			this.bottomBorder(frameWidth),
 		];
 		return lines.map((line) => truncateToWidth(line, frameWidth, ""));
@@ -243,8 +243,18 @@ export class BtwPopupController implements Component, Focusable {
 		return wrapTextWithAnsi(this.theme.fg(color, text), width);
 	}
 
+	/** Transcript rows the frame may draw at most, given the terminal height cap. */
+	private maxViewportRows(): number {
+		const maxRows = Math.max(MIN_VIEWPORT_ROWS + POPUP_CHROME_ROWS, Math.floor(this.terminalRows() * 0.8));
+		return Math.max(MIN_VIEWPORT_ROWS, maxRows - POPUP_CHROME_ROWS);
+	}
+
+	/** Rows actually shown for the current transcript — one page for PgUp/PgDn. */
 	private viewportRows(): number {
-		return Math.max(1, Math.max(MIN_POPUP_ROWS, Math.floor(this.terminalRows() * 0.9)) - 7);
+		const innerWidth = Math.max(10, this.lastWidth - 2);
+		const bodyWidth = Math.max(10, innerWidth - POPUP_PADDING * 2);
+		const transcript = this.renderTranscript(bodyWidth);
+		return Math.min(Math.max(transcript.length, MIN_VIEWPORT_ROWS), this.maxViewportRows());
 	}
 
 	private maxScroll(): number {
@@ -259,11 +269,6 @@ export class BtwPopupController implements Component, Focusable {
 
 	private requestRender(): void {
 		this.tui.requestRender();
-	}
-
-	private headerText(width: number): string {
-		const text = `BTW · ${this.modelLabel}`;
-		return this.theme.fg("accent", truncateToWidth(text, width, "…"));
 	}
 
 	private boxRow(content: string, bodyWidth: number): string {

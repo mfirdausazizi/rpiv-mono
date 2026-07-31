@@ -51,8 +51,8 @@ No skills, agents, CLI flags, or tools are registered.
 | Option | Value |
 | --- | --- |
 | `anchor` | `center` |
-| `width` | `90%` |
-| `maxHeight` | `90%` |
+| `width` | `75%` |
+| `maxHeight` | `80%` |
 | `margin` | `1` |
 
 The controller implements `Component` and `Focusable`. It owns one native
@@ -73,8 +73,11 @@ Only one request may be active. Every submission receives a fresh
 `Enter send · PgUp/PgDn scroll · Ctrl+L clear · Esc close`
 
 Scroll is stored as rows from the bottom: zero is newest. New submissions and
-completed requests return to the newest content. Fixed header/input/footer rows
-are excluded from the transcript viewport, including on short terminals.
+completed requests return to the newest content. The popup's height follows its
+content: it grows only as far as the transcript needs, up to the terminal cap, so a
+short answer draws a short popup instead of an empty full-height frame. Fixed
+title-border/input/footer rows are excluded from the transcript viewport, including
+on short terminals.
 
 ## Command and execution flow
 
@@ -96,11 +99,16 @@ content without triggering compaction.
 
 If the first provider response is an error reporting `maximum prompt length is
 500000` or `500,000`, the numeric cap is parsed, reduced by 10%, and used to
-build a temporary model context window targeting that prompt limit. The request
-is rebuilt from the unchanged source snapshot and retried once. If no numeric cap
-is available but the host overflow helper recognizes the error, the existing
-half-budget fallback is used. A second overflow is returned as an error; there
-is never a third completion call.
+build a temporary model context window targeting that prompt limit. When the error
+also reports its own token count (`the request contains 1047984 tokens`), that
+count is compared against `/btw`'s own chars/4 estimate of the same prompt and the
+branch budget is scaled by the difference — the provider's tokenizer is the only
+ground truth for how far the estimate diverges, and without it an undercounting
+estimate keeps "fitting" its budget and the retry resends an identical request. The
+request is rebuilt from the unchanged source snapshot and retried once. If no
+numeric cap is available but the host overflow helper recognizes the error, the
+existing half-budget fallback is used. A second overflow is returned as an error;
+there is never a third completion call.
 
 ## Host compatibility
 
