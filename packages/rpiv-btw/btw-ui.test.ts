@@ -158,6 +158,47 @@ describe("BtwPopupController input and requests", () => {
 		expect(done).not.toHaveBeenCalled();
 		expect(ctl.render(100).join("\n")).not.toContain("old answer");
 	});
+
+	it("animates the pending indicator with elapsed time while waiting", async () => {
+		vi.useFakeTimers();
+		try {
+			const onSubmit = vi.fn(() => new Promise<BtwPopupSubmitResult>(() => {}));
+			const { ctl, tui } = makeController({ onSubmit });
+			for (const char of "slow question") ctl.handleInput(char);
+			ctl.handleInput("\r");
+
+			const initial = ctl.render(80).join("\n");
+			expect(initial).toContain("waiting for answer");
+			expect(initial).toContain("0s");
+
+			const rendersBefore = vi.mocked(tui.requestRender).mock.calls.length;
+			await vi.advanceTimersByTimeAsync(3_000);
+			expect(vi.mocked(tui.requestRender).mock.calls.length).toBeGreaterThan(rendersBefore);
+			expect(ctl.render(80).join("\n")).toContain("3s");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("stops the pending ticker once the request settles", async () => {
+		vi.useFakeTimers();
+		try {
+			let resolve!: (result: BtwPopupSubmitResult) => void;
+			const onSubmit = vi.fn(() => new Promise<BtwPopupSubmitResult>((r) => (resolve = r)));
+			const { ctl, tui } = makeController({ onSubmit });
+			for (const char of "q") ctl.handleInput(char);
+			ctl.handleInput("\r");
+			resolve({ kind: "success", answer: "done answer" });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(ctl.render(80).join("\n")).toContain("done answer");
+
+			const rendersAfterSettle = vi.mocked(tui.requestRender).mock.calls.length;
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(vi.mocked(tui.requestRender).mock.calls.length).toBe(rendersAfterSettle);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });
 
 describe("BtwPopupController viewport", () => {

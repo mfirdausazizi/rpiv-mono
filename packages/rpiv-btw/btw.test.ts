@@ -582,6 +582,37 @@ describe("executeBtw — overflow retry", () => {
 		expect(JSON.stringify(calls[1][1].messages).length).toBeLessThan(1_100_000);
 	});
 
+	it("explains an impossible output allowance when both attempts overflow", async () => {
+		// grok-4.5 via CLIProxyAPI: the provider reserves the model's full 500k output
+		// allowance against the same 500k prompt limit, so no amount of prompt trimming
+		// can ever fit. The final error must say so instead of looking like a /btw bug.
+		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage("b".repeat(2_400_000))]) });
+		ctx.model = {
+			provider: "cliproxyapi",
+			id: "grok-4.5",
+			api: "cliproxyapi-codex-responses",
+			contextWindow: 500_000,
+			maxTokens: 500_000,
+		} as never;
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
+		const overflowError = (tokens: number) =>
+			makeCompletionResponse({
+				stopReason: "error",
+				errorMessage: `This model's maximum prompt length is 500000 but the request contains ${tokens} tokens.`,
+			}) as never;
+		vi.mocked(completeSimple)
+			.mockResolvedValueOnce(overflowError(958_013))
+			.mockResolvedValueOnce(overflowError(910_000));
+
+		const result = await executeBtw("q", ctx, new AbortController());
+
+		expect(result.kind).toBe("error");
+		if (result.kind !== "error") throw new Error("unexpected");
+		expect(result.error).toContain("output");
+		expect(result.error).toContain("max_output_tokens");
+		expect(result.error).toContain("500000");
+	});
+
 	it("still retries on a numeric cap with no reported token count", async () => {
 		const branchText = "z".repeat(2_400_000);
 		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage(branchText)]) });

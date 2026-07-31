@@ -142,6 +142,23 @@ function retryKeepBudget(built: BtwBuiltContext, overflow: PromptOverflow): numb
 	return Math.max(0, safeWholePrompt - built.nonBranchEstimate);
 }
 
+/**
+ * A provider that reserves the model's full output allowance against its own
+ * prompt limit (grok-4.5 via CLIProxyAPI: 500k output vs a 500k prompt cap) can
+ * never accept a request, no matter how hard the prompt is trimmed. Say so
+ * explicitly instead of surfacing what looks like a /btw budgeting bug, and point
+ * at the boundary that can actually fix it.
+ */
+function impossibleOutputAllowanceHint(model: Model<Api>, errorMessage: string | undefined): string {
+	const overflow = parsePromptOverflow(errorMessage);
+	if (!overflow || model.maxTokens < overflow.limit) return "";
+	return (
+		` — ${model.provider}/${model.id} reserves up to ${model.maxTokens} output tokens against the same ` +
+		`${overflow.limit}-token prompt limit, so no prompt can fit. Cap the output allowance at the provider, ` +
+		`e.g. a CLIProxyAPI payload default of max_output_tokens for this model, or pick another /btw model.`
+	);
+}
+
 // Budget (context-budgeting) constants — defined in btw-budget.ts (the leaf budget
 // module; keeps the module cycle type-only at runtime), re-exported here so the
 // package surface is unchanged.
@@ -443,7 +460,7 @@ export async function executeBtw(
 		if (response.stopReason === "error") {
 			return {
 				kind: "error",
-				error: errCallFailed(response.errorMessage),
+				error: errCallFailed(response.errorMessage) + impossibleOutputAllowanceHint(model, response.errorMessage),
 				stopReason: response.stopReason,
 			};
 		}

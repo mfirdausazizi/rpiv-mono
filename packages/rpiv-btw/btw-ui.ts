@@ -21,12 +21,15 @@ const POPUP_PADDING = 1;
 const POPUP_CHROME_ROWS = 5;
 const MIN_VIEWPORT_ROWS = 3;
 const FOOTER_TEXT = "Enter send · PgUp/PgDn scroll · Ctrl+L clear · Esc close";
-const PENDING_TEXT = "… waiting for answer";
+const PENDING_TEXT = "waiting for answer";
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const PENDING_TICK_MS = 1_000;
 const TRIMMED_TEXT = "context trimmed to fit budget";
 
 type PopupTurn = {
 	question: string;
 	status: "pending" | "answer" | "error";
+	startedAt?: number;
 	answer?: string;
 	error?: string;
 	trimmed?: boolean;
@@ -64,6 +67,7 @@ export class BtwPopupController implements Component, Focusable {
 	private closed = false;
 	private _focused = true;
 	private initialQuestion: string | undefined;
+	private pendingTimer: ReturnType<typeof setInterval> | undefined;
 
 	constructor(options: BtwPopupControllerOptions) {
 		this.theme = options.theme;
@@ -158,8 +162,11 @@ export class BtwPopupController implements Component, Focusable {
 		const question = value.trim();
 		if (!question) return;
 		this.input.setValue("");
-		const turn: PopupTurn = { question, status: "pending" };
+		const turn: PopupTurn = { question, status: "pending", startedAt: Date.now() };
 		this.turns.push(turn);
+		// Tick once a second while waiting so the elapsed counter proves the request
+		// is still alive — completeSimple is non-streaming, so nothing else re-renders.
+		this.pendingTimer = setInterval(() => this.requestRender(), PENDING_TICK_MS);
 		this.scrollFromBottom = 0;
 		const controller = new AbortController();
 		this.activeController = controller;
@@ -188,12 +195,20 @@ export class BtwPopupController implements Component, Focusable {
 			}
 		} finally {
 			if (this.activeController === controller) this.activeController = undefined;
+			if (this.pendingTimer !== undefined) {
+				clearInterval(this.pendingTimer);
+				this.pendingTimer = undefined;
+			}
 		}
 	}
 
 	private close(): void {
 		if (this.closed) return;
 		this.closed = true;
+		if (this.pendingTimer !== undefined) {
+			clearInterval(this.pendingTimer);
+			this.pendingTimer = undefined;
+		}
 		this.activeController?.abort();
 		this.done();
 	}
@@ -215,7 +230,9 @@ export class BtwPopupController implements Component, Focusable {
 			lines.push(...this.wrapPlain(`> ${turn.question}`, width, "accent"));
 			lines.push(this.theme.fg("muted", "BTW"));
 			if (turn.status === "pending") {
-				lines.push(this.theme.fg("warning", PENDING_TEXT));
+				const elapsed = Math.max(0, Math.floor((Date.now() - (turn.startedAt ?? Date.now())) / 1000));
+				const frame = SPINNER_FRAMES[elapsed % SPINNER_FRAMES.length];
+				lines.push(this.theme.fg("warning", `${frame} ${PENDING_TEXT} · ${elapsed}s`));
 			} else if (turn.status === "error") {
 				lines.push(...this.wrapPlain(turn.error ?? "unknown error", width, "error"));
 			} else {
