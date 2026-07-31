@@ -10,6 +10,8 @@ import { BTW_SETTINGS_COMMAND_NAME, FOLLOW_SESSION_LABEL, registerBtwSettingsCom
 import { saveBtwConfig } from "./config.js";
 
 const plain = { provider: "a", id: "plain", name: "Plain" } as unknown as Model<Api>;
+const matchFirst = { provider: "a", id: "first", name: "Match First" } as unknown as Model<Api>;
+const matchSecond = { provider: "a", id: "second", name: "Match Second" } as unknown as Model<Api>;
 const reasoning = {
 	provider: "cliproxyapi",
 	id: "gpt-5.6-sol",
@@ -21,6 +23,38 @@ function register() {
 	const { pi, captured } = createMockPi();
 	registerBtwSettingsCommand(pi);
 	return captured.commands.get(BTW_SETTINGS_COMMAND_NAME)!;
+}
+
+type CustomFactory = (
+	tui: { requestRender: () => void },
+	theme: {
+		fg: (_color: string, text: string) => string;
+		bg: (_color: string, text: string) => string;
+		bold: (text: string) => string;
+	},
+	keybindings: unknown,
+	done: (value: string | undefined) => void,
+) => { handleInput: (data: string) => void };
+
+function searchableCustom(query: string) {
+	return vi.fn(async (factory: CustomFactory) => {
+		let selected: string | undefined;
+		let closed = false;
+		const component = factory(
+			{ requestRender: vi.fn() },
+			{ fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text },
+			{},
+			(value) => {
+				selected = value;
+				closed = true;
+			},
+		);
+		for (const character of query) {
+			if (!closed) component.handleInput(character);
+		}
+		if (!closed) component.handleInput("\r");
+		return selected;
+	});
 }
 
 beforeEach(() => {
@@ -39,6 +73,51 @@ describe("/btw-settings", () => {
 		const ctx = createMockCtx({ hasUI: true, models: [reasoning] });
 		await register().handler("", ctx as never);
 		expect(saveBtwConfig).not.toHaveBeenCalled();
+	});
+
+	it("shows only scoped models when a scope is configured", async () => {
+		const ctx = createMockCtx({ hasUI: true, mode: "rpc", models: [plain, reasoning] });
+		(ctx as never as { scopedModels: Array<{ model: Model<Api> }> }).scopedModels = [{ model: plain }];
+		vi.mocked(ctx.ui.select).mockResolvedValueOnce("Plain (a/plain)");
+		await register().handler("", ctx as never);
+		expect(ctx.ui.select).toHaveBeenNthCalledWith(1, "BTW model", [FOLLOW_SESSION_LABEL, "Plain (a/plain)"]);
+		expect(saveBtwConfig).toHaveBeenCalledWith({ modelKey: "a/plain" });
+	});
+
+	it("shows all available models when no scope is configured", async () => {
+		const ctx = createMockCtx({ hasUI: true, mode: "rpc", models: [plain, reasoning] });
+		(ctx as never as { scopedModels: [] }).scopedModels = [];
+		vi.mocked(ctx.ui.select).mockResolvedValueOnce("Plain (a/plain)");
+		await register().handler("", ctx as never);
+		expect(ctx.ui.select).toHaveBeenNthCalledWith(1, "BTW model", [
+			FOLLOW_SESSION_LABEL,
+			"Plain (a/plain)",
+			"GPT 5.6 Sol (cliproxyapi/gpt-5.6-sol)",
+		]);
+	});
+
+	it("searches multi-word model names in TUI mode", async () => {
+		const custom = searchableCustom("match second");
+		const ctx = createMockCtx({
+			hasUI: true,
+			mode: "tui",
+			models: [matchFirst, matchSecond],
+			ui: { custom } as never,
+		});
+		await register().handler("", ctx as never);
+		expect(custom).toHaveBeenCalledOnce();
+		expect(saveBtwConfig).toHaveBeenCalledWith({ modelKey: "a/second" });
+	});
+
+	it("searches provider and model IDs in TUI mode", async () => {
+		const custom = searchableCustom("cliproxyapi/gpt-5.6-sol");
+		const ctx = createMockCtx({ hasUI: true, mode: "tui", models: [plain, reasoning], ui: { custom } as never });
+		vi.mocked(ctx.ui.select).mockResolvedValueOnce("medium");
+		await register().handler("", ctx as never);
+		expect(saveBtwConfig).toHaveBeenCalledWith({
+			modelKey: "cliproxyapi/gpt-5.6-sol",
+			effort: "medium",
+		});
 	});
 
 	it("clears overrides when following the current session", async () => {

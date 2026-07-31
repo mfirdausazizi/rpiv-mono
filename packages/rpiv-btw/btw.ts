@@ -2,8 +2,8 @@
  * @juicesharp/rpiv-btw — /btw side-question slash command.
  *
  * Asks the same primary model a one-off side question using the cloned primary
- * conversation as context. Answer is rendered ephemerally in a bottom-slot
- * overlay (never enters main agent's messages). History persists per-session-file
+ * conversation as context. Answer is rendered ephemerally in a centered chat
+ * popup (never enters main agent's messages). History persists per-session-file
  * via globalThis-keyed storage; process-scoped only (no disk persistence).
  */
 
@@ -26,9 +26,9 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { parseModelKey } from "@juicesharp/rpiv-config";
-import { type CappedHistory, capHistory, type FitBranchResult, fitBranch } from "./btw-budget.js";
+import { BTW_CONTEXT_RESERVE, type CappedHistory, capHistory, type FitBranchResult, fitBranch } from "./btw-budget.js";
 import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
-import { showBtwOverlay } from "./btw-ui.js";
+import { type BtwPopupSubmitResult, showBtwPopup } from "./btw-ui.js";
 import { type BtwEffort, loadBtwConfig } from "./config.js";
 import { getRuntimeCompleteSimple, loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
 
@@ -48,7 +48,6 @@ export const CROSS_SESSION_HINT_LIMIT = 10;
 
 // Messages (static)
 const MSG_REQUIRES_INTERACTIVE = "/btw requires interactive mode";
-const MSG_USAGE = "Usage: /btw <question>";
 const MSG_NO_MODEL = "/btw requires an active model";
 const errConfiguredModelUnavailable = (key: string) =>
 	`Configured /btw model ${key} is no longer available; run /btw-settings`;
@@ -61,6 +60,21 @@ const errMisconfigured = (label: string, err: string) => `/btw model (${label}) 
 const errNoApiKey = (label: string) => `/btw model (${label}) has no API key available.`;
 const errCallFailed = (err: string | undefined) => `/btw call failed: ${err ?? "unknown error"}`;
 const errCallThrew = (msg: string) => `/btw call threw: ${msg}`;
+
+function parsePromptLimit(message: string | undefined): number | undefined {
+	const match = message?.match(/maximum prompt length is\s+([\d,]+)/i);
+	if (!match) return undefined;
+	const limit = Number(match[1]!.replaceAll(",", ""));
+	return Number.isSafeInteger(limit) && limit > 0 ? limit : undefined;
+}
+
+function modelForPromptLimit(model: Model<Api>, reportedLimit: number): Model<Api> {
+	const safePromptLimit = Math.floor(reportedLimit * 0.9);
+	return {
+		...model,
+		contextWindow: safePromptLimit + (model.maxTokens ?? 0) + BTW_CONTEXT_RESERVE,
+	};
+}
 
 // Budget (context-budgeting) constants — defined in btw-budget.ts (the leaf budget
 // module; keeps the module cycle type-only at runtime), re-exported here so the
@@ -219,7 +233,7 @@ export interface BtwBuiltContext {
 	droppedTurns: number;
 	branchWasTrimmed: boolean;
 	stubbed: boolean;
-	keepBudget: number; // halved by the overflow-retry caller to tighten the branch budget
+	keepBudget: number; // reduced by the bounded overflow-retry caller to tighten the branch budget
 }
 
 export function buildBtwMessages(
@@ -253,7 +267,7 @@ export function buildBtwMessages(
 		}
 	} else {
 		// Overflow retry: the sent request has already proven too large — take the
-		// capped history and trim/stub the branch straight to the halved budget.
+		// capped history and trim/stub the branch to the retry budget.
 		capped = capHistory(history);
 		fit = fitBranch({ ...fitInput, admittedEstimate: capped.estimate, keepBudget });
 	}
@@ -302,7 +316,7 @@ export async function executeBtw(
 		content: [{ type: "text", text: question }],
 		timestamp: Date.now(),
 	};
-	// `let` because the overflow retry reassigns `built` with a halved budget;
+	// `let` because the overflow retry rebuilds `built` with a reduced model window;
 	// buildBtwMessages returns BtwBuiltContext { messages, systemPrompt,
 	// droppedTurns, branchWasTrimmed, stubbed, keepBudget }.
 	let built = buildBtwMessages(ctx, userMessage, undefined, model);
@@ -311,13 +325,13 @@ export async function executeBtw(
 		const runtimeCompleteSimple = getRuntimeCompleteSimple(ctx.modelRegistry);
 		const completeSimple = runtimeCompleteSimple ?? (await loadCompleteSimple());
 		const overflowFn = await loadIsContextOverflow();
-		let retried = false;
 		const callCompleteSimple = async (
 			built: BtwBuiltContext,
+			effectiveModel: Model<Api> = model,
 		): Promise<{ kind: "aborted"; stopReason: StopReason } | { kind: "completed"; response: AssistantMessage }> => {
 			const requestReasoning = reasoning as ThinkingLevel | undefined;
 			const response = await completeSimple(
-				model,
+				effectiveModel,
 				{ systemPrompt: built.systemPrompt, messages: built.messages, tools: [] },
 				// Runtime auth must resolve its own key/headers/baseUrl; explicit overrides bypass it.
 				runtimeCompleteSimple
@@ -337,17 +351,19 @@ export async function executeBtw(
 		let outcome = await callCompleteSimple(built);
 		if (outcome.kind === "aborted") return outcome;
 		let response = outcome.response;
-		// Overflow gate — exactly one retry. On the first response the host flags
-		// as context overflow (any stopReason), rebuild the branch context with a
-		// halved keepBudget and re-call once. A flag bounds it to one retry; the
-		// recall's throw and the loader's rethrow both land in the surrounding
-		// catch. /btw's fresh side call retries all three overflow stopReasons
-		// (error/stop/length), a deliberate divergence from the host's
-		// stopReason-based willRetry.
-		if (overflowFn && !retried && overflowFn(response, model.contextWindow)) {
-			retried = true;
-			built = buildBtwMessages(ctx, userMessage, Math.floor(built.keepBudget / 2), model);
-			outcome = await callCompleteSimple(built);
+		// Overflow gate — exactly one retry. Provider-reported prompt caps take
+		// precedence; otherwise retain the legacy half-budget fallback.
+		const reportedPromptLimit = response.stopReason === "error" ? parsePromptLimit(response.errorMessage) : undefined;
+		const overflow =
+			reportedPromptLimit !== undefined ||
+			(response.stopReason === "error" && Boolean(overflowFn?.(response, model.contextWindow)));
+		if (overflow) {
+			const retryModel = reportedPromptLimit === undefined ? model : modelForPromptLimit(model, reportedPromptLimit);
+			built =
+				reportedPromptLimit === undefined
+					? buildBtwMessages(ctx, userMessage, Math.floor(built.keepBudget / 2), retryModel)
+					: buildBtwMessages(ctx, userMessage, undefined, retryModel);
+			outcome = await callCompleteSimple(built, retryModel);
 			if (outcome.kind === "aborted") return outcome;
 			response = outcome.response;
 		}
@@ -432,50 +448,34 @@ async function handleBtwCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCo
 		return;
 	}
 	const question = args.trim();
-	if (!question) {
-		ctx.ui.notify(MSG_USAGE, "warning");
-		return;
-	}
 	const execution = resolveBtwExecution(pi, ctx);
 	if ("error" in execution) {
 		ctx.ui.notify(execution.error, "error");
 		return;
 	}
 
-	const controller = new AbortController();
+	const model = execution.model!;
+	const modelLabel = `${model.provider}/${model.id}${execution.reasoning ? ` · ${execution.reasoning}` : ""}`;
 	const historySnapshot = [...getSessionHistory(ctx)];
-
-	const { overlayPromise, controllerReady } = showBtwOverlay({
+	const { overlayPromise } = showBtwPopup({
 		ctx,
-		question,
+		initialQuestion: question || undefined,
 		history: historySnapshot,
-		controller,
+		modelLabel,
 		onClearHistory: () => clearSessionHistory(ctx),
+		onSubmit: async (submittedQuestion, controller): Promise<BtwPopupSubmitResult> => {
+			const result = await executeBtw(submittedQuestion, ctx, controller, execution);
+			if (controller.signal.aborted) return { kind: "aborted" };
+			if (result.kind === "success") {
+				pushSessionTurn(ctx, {
+					userMessage: result.userMessage,
+					assistantMessage: result.assistantMessage,
+				});
+				return { kind: "success", answer: result.answer, trimmed: result.trimmed };
+			}
+			if (result.kind === "aborted") return { kind: "aborted" };
+			return { kind: "error", error: result.error };
+		},
 	});
-
-	const overlayCtl = await controllerReady;
-	const result = await executeBtw(question, ctx, controller, execution);
-
-	switch (result.kind) {
-		case "success": {
-			overlayCtl.setAnswer(result.answer);
-			if (result.trimmed) overlayCtl.setTrimmed(); // success-only: TS narrows result here
-			pushSessionTurn(ctx, {
-				userMessage: result.userMessage,
-				assistantMessage: result.assistantMessage,
-			});
-			// No disk persistence — process-scoped only (Decision 4)
-			break;
-		}
-		case "aborted": {
-			// User Esc'd — overlay already dismissed via done(); no further action
-			break;
-		}
-		case "error": {
-			overlayCtl.setError(result.error);
-			break;
-		}
-	}
-
 	await overlayPromise;
 }

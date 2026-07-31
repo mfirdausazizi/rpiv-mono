@@ -10,10 +10,8 @@
  * no back-edge into `btw.ts`. `btw.ts` re-exports all three symbols so the
  * package surface (and the `*.test.ts` imports from `./btw.js`) is unchanged.
  *
- * The phantom type-only cycle `btw.ts ↔ btw-budget.ts` (`btw-budget.ts:22`
- * `import type { BtwTurn } from "./btw.js"`) is intentionally left in place —
- * it is runtime-inert (erased) and repointing it is owned by no phase in this
- * plan (see plan risk r6).
+ * `btw.ts` re-exports all three symbols so the package surface (and the
+ * `*.test.ts` imports from `./btw.js`) is unchanged.
  */
 
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";

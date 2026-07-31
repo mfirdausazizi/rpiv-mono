@@ -1,268 +1,337 @@
-/**
- * btw-ui — dynamic-height bottom-slot overlay for /btw.
- *
- * Layout (grows with content, bottom-anchored, max = terminal height):
- *   banner (theme.bg stripe, padded to width)        sticky top
- *   blank
- *   history  — "/btw <q>" (accent prefix + muted text), left-padded 2 cols
- *   echo     — "/btw <q>" (accent prefix + muted text), left-padded 2 cols
- *   blank
- *   answer   — body wrapped at width-2, left-padded 2 cols
- *   blank
- *   footer   — key hints (dim)                       sticky bottom
- *
- * Natural height = fixed(5: banner, 3 blanks, footer) + 2 (echo + 1 blank before answer)
- *                  + history.length + answerLines.length.
- * Pi-tui bottom-anchors the overlay so it grows upward with each /btw message.
- * If natural height > terminal rows, we clip from the top (older history scrolls off)
- * and ↑/↓ scroll the clip window.
- *
- * Keys (via matchesKey — handles ANSI + Kitty):
- *   Esc → abort in-flight call + dismiss
- *   ↑/↓ → scroll (when content exceeds terminal)
- *   x   → clear current-session /btw history
- *   (f fork key deferred)
- */
-
-import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { OverlayOptions } from "@earendil-works/pi-tui";
+import { type ExtensionCommandContext, getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
+	type Focusable,
+	Input,
 	Key,
+	Markdown,
 	matchesKey,
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { type BtwTurn, userMessageText } from "./btw-messages.js";
+import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
 
-const BTW_MAX_HEIGHT_RATIO = 0.85;
+const POPUP_WIDTH = "90%";
+const POPUP_MAX_HEIGHT = "90%";
+const POPUP_PADDING = 1;
+const MIN_POPUP_ROWS = 8;
+const FOOTER_TEXT = "Enter send · PgUp/PgDn scroll · Ctrl+L clear · Esc close";
+const PENDING_TEXT = "… waiting for answer";
+const TRIMMED_TEXT = "context trimmed to fit budget";
 
-const BTW_OVERLAY_OPTIONS: OverlayOptions = {
-	anchor: "bottom-center",
-	width: "100%",
-	maxHeight: `${BTW_MAX_HEIGHT_RATIO * 100}%`,
-	margin: { left: 0, right: 0, bottom: 0 },
+type PopupTurn = {
+	question: string;
+	status: "pending" | "answer" | "error";
+	answer?: string;
+	error?: string;
+	trimmed?: boolean;
 };
 
-const SIDE_PAD = "  "; // 2-col left gutter for history, echo, footer
-const ANSWER_PAD = "    "; // 4-col left gutter for answer body (double of SIDE_PAD)
-const BTW_LITERAL = "/btw";
-const PENDING_GLYPH = "…";
-const FOOTER_SCROLL = "↑/↓ to scroll";
-const FOOTER_CLEAR = "x to clear history";
-const FOOTER_DISMISS = "Esc to dismiss";
-const FOOTER_SEP = " · ";
-const MSG_TRIMMED = "context trimmed to fit budget";
+export type BtwPopupSubmitResult =
+	| { kind: "success"; answer: string; trimmed?: boolean }
+	| { kind: "error"; error: string }
+	| { kind: "aborted" };
 
-type Mode = "pending" | "answer" | "error";
-
-export interface ShowBtwOverlayParams {
-	ctx: ExtensionCommandContext;
-	question: string;
+export interface BtwPopupControllerOptions {
+	initialQuestion?: string;
 	history: BtwTurn[];
-	controller: AbortController;
+	modelLabel: string;
+	theme: Theme;
+	tui: TUI;
+	done: () => void;
+	onSubmit: (question: string, controller: AbortController) => Promise<BtwPopupSubmitResult>;
 	onClearHistory: () => void;
 }
 
-export interface ShowBtwOverlayResult {
-	overlayPromise: Promise<void>;
-	controllerReady: Promise<BtwOverlayController>;
-}
+export class BtwPopupController implements Component, Focusable {
+	private readonly theme: Theme;
+	private readonly tui: TUI;
+	private readonly done: () => void;
+	private readonly onSubmit: BtwPopupControllerOptions["onSubmit"];
+	private readonly onClearHistory: () => void;
+	private readonly modelLabel: string;
+	private readonly input = new Input();
+	private readonly markdown = new Map<PopupTurn, Markdown>();
+	private turns: PopupTurn[];
+	private scrollFromBottom = 0;
+	private activeController: AbortController | undefined;
+	private lastWidth = 80;
+	private closed = false;
+	private _focused = true;
+	private initialQuestion: string | undefined;
 
-export class BtwOverlayController implements Component {
-	private mode: Mode = "pending";
-	private answer = "";
-	private error = "";
-	private scrollOffset = 0;
-	private trimmed = false;
-	private history: BtwTurn[];
-
-	constructor(
-		private readonly question: string,
-		history: BtwTurn[],
-		private readonly theme: Theme,
-		private readonly tui: TUI,
-		private readonly done: (result?: undefined) => void,
-		private readonly controller: AbortController,
-		private readonly onClearHistory: () => void,
-	) {
-		this.history = [...history];
+	constructor(options: BtwPopupControllerOptions) {
+		this.theme = options.theme;
+		this.tui = options.tui;
+		this.done = options.done;
+		this.onSubmit = options.onSubmit;
+		this.onClearHistory = options.onClearHistory;
+		this.modelLabel = options.modelLabel;
+		this.initialQuestion = options.initialQuestion?.trim() || undefined;
+		this.turns = options.history.map((turn) => ({
+			question: userMessageText(turn.userMessage),
+			status: "answer",
+			answer: assistantMessageText(turn.assistantMessage),
+		}));
+		this.input.onSubmit = (value) => void this.submit(value);
+		this.input.onEscape = () => this.close();
+		this.input.focused = true;
 	}
 
-	setAnswer(text: string): void {
-		this.mode = "answer";
-		this.answer = text;
-		this.tui.requestRender();
+	get focused(): boolean {
+		return this._focused;
 	}
 
-	setError(message: string): void {
-		this.mode = "error";
-		this.error = message;
-		this.tui.requestRender();
+	set focused(value: boolean) {
+		this._focused = value;
+		this.input.focused = value;
 	}
 
-	// Orthogonal to mode: a trimmed result is also a successful answer.
-	// Idempotent; a fresh controller is built per /btw command in showBtwOverlay,
-	// so there is no reset path.
-	setTrimmed(): void {
-		this.trimmed = true;
-		this.tui.requestRender();
+	startInitialQuestion(): void {
+		const question = this.initialQuestion;
+		this.initialQuestion = undefined;
+		if (question) void this.submit(question);
 	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape)) {
-			this.controller.abort();
-			this.done();
+			this.close();
 			return;
 		}
-		if (matchesKey(data, Key.up)) {
-			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
-			this.tui.requestRender();
+		if (matchesKey(data, Key.ctrl("l"))) {
+			this.clearHistory();
 			return;
 		}
-		if (matchesKey(data, Key.down)) {
-			this.scrollOffset = this.scrollOffset + 1;
-			this.tui.requestRender();
+		if (matchesKey(data, Key.pageUp)) {
+			this.scrollFromBottom = Math.min(this.maxScroll(), this.scrollFromBottom + this.viewportRows());
+			this.requestRender();
 			return;
 		}
-		if (data === "x") {
-			this.history = [];
-			this.onClearHistory();
-			this.scrollOffset = 0;
-			this.tui.requestRender();
+		if (matchesKey(data, Key.pageDown)) {
+			this.scrollFromBottom = Math.max(0, this.scrollFromBottom - this.viewportRows());
+			this.requestRender();
 			return;
 		}
+		this.input.handleInput(data);
+		this.requestRender();
 	}
 
 	render(width: number): string[] {
-		const banner = this.renderBanner(width);
-		const historyLines = this.history.map((h) => this.historyLine(userMessageText(h.userMessage), width));
-		const echoLine = this.echoLine(this.question, width);
-		const answerLines = this.renderAnswer(width);
-		const footerAvail = Math.max(1, width - SIDE_PAD.length);
-		const footerParts: string[] = [];
-		if (this.mode !== "pending") footerParts.push(FOOTER_SCROLL);
-		if (this.history.length > 0) footerParts.push(FOOTER_CLEAR);
-		footerParts.push(FOOTER_DISMISS);
-		const footer =
-			SIDE_PAD + truncateToWidth(this.theme.fg("dim", footerParts.join(FOOTER_SEP)), footerAvail, "…", false);
+		this.lastWidth = Math.max(40, width);
+		const frameWidth = this.lastWidth;
+		const innerWidth = Math.max(10, frameWidth - 2);
+		const bodyWidth = Math.max(10, innerWidth - POPUP_PADDING * 2);
+		const maxRows = Math.max(MIN_POPUP_ROWS, Math.floor(this.terminalRows() * 0.9));
+		const viewportRows = Math.max(1, maxRows - 7);
+		const transcript = this.renderTranscript(bodyWidth);
+		const maxScroll = Math.max(0, transcript.length - viewportRows);
+		this.scrollFromBottom = Math.min(this.scrollFromBottom, maxScroll);
+		const end = transcript.length - this.scrollFromBottom;
+		const start = Math.max(0, end - viewportRows);
+		const visible = transcript.slice(start, end);
+		while (visible.length < viewportRows) visible.unshift("");
 
-		// Natural content: banner + blank + history + echo + blank + answer [+ trim notice] + blank + footer
-		const natural: string[] = [
-			banner,
-			"",
-			...historyLines,
-			echoLine,
-			"",
-			...answerLines,
-			...(this.trimmed
-				? [
-						ANSWER_PAD +
-							truncateToWidth(
-								this.theme.fg("warning", MSG_TRIMMED),
-								Math.max(1, width - ANSWER_PAD.length),
-								"…",
-								false,
-							),
-					]
-				: []),
-			"",
-			footer,
+		const lines = [
+			this.topBorder(frameWidth),
+			this.boxRow("", bodyWidth),
+			this.boxRow(this.headerText(bodyWidth), bodyWidth),
+			this.boxRow("", bodyWidth),
+			...visible.map((line) => this.boxRow(line, bodyWidth)),
+			this.divider(innerWidth),
+			this.boxRow(`> ${this.input.render(Math.max(1, bodyWidth - 2)).join("")}`, bodyWidth),
+			this.boxRow(this.theme.fg("dim", FOOTER_TEXT), bodyWidth),
+			this.boxRow("", bodyWidth),
+			this.bottomBorder(frameWidth),
 		];
-
-		// Clip to terminal height if we overflow. Bottom-anchor keeps footer+answer visible;
-		// ↑/↓ scrolls the top (history) up into the clipped region.
-		const termRows = (this.tui.terminal as { rows?: number }).rows ?? 24;
-		const maxRows = Math.max(4, Math.floor(termRows * BTW_MAX_HEIGHT_RATIO));
-		if (natural.length <= maxRows) {
-			return natural;
-		}
-		const excess = natural.length - maxRows;
-		if (this.scrollOffset > excess) this.scrollOffset = excess;
-		// scrollOffset=0 shows the BOTTOM (newest). Scrolling up reveals older history.
-		const start = excess - this.scrollOffset;
-		return natural.slice(start, start + maxRows);
+		return lines.map((line) => truncateToWidth(line, frameWidth, ""));
 	}
 
 	invalidate(): void {
-		// no-op — render recomputes from state each cycle
+		this.input.invalidate();
+		for (const markdown of this.markdown.values()) markdown.invalidate();
 	}
 
-	private renderBanner(width: number): string {
-		const prefix = `${SIDE_PAD}${BTW_LITERAL} `;
-		const prefixWidth = visibleWidth(prefix);
-		const qAvail = Math.max(0, width - prefixWidth);
-		const qTrunc = truncateToWidth(this.question, qAvail, "…", false);
-		const raw = prefix + qTrunc;
-		const padded = raw + " ".repeat(Math.max(0, width - visibleWidth(raw)));
-		return this.theme.bg("customMessageBg", this.theme.fg("customMessageText", padded));
-	}
-
-	private historyLine(question: string, width: number): string {
-		const qAvail = Math.max(0, width - SIDE_PAD.length);
-		const qClean = question.replace(/\s+/g, " ").trim();
-		const raw = `${BTW_LITERAL} ${qClean}`;
-		const trunc = truncateToWidth(raw, qAvail, "…", false);
-		return SIDE_PAD + this.theme.fg("muted", trunc);
-	}
-
-	private echoLine(question: string, width: number): string {
-		const bodyAvail = Math.max(1, width - SIDE_PAD.length);
-		const prefixWidth = visibleWidth(BTW_LITERAL) + 1; // "/btw "
-		const qAvail = Math.max(0, bodyAvail - prefixWidth);
-		const qClean = question.replace(/\s+/g, " ").trim();
-		const qTrunc = truncateToWidth(qClean, qAvail, "…", false);
-		return `${SIDE_PAD + this.theme.fg("accent", BTW_LITERAL)} ${this.theme.fg("muted", qTrunc)}`;
-	}
-
-	private wrapBodyLines(text: string, bodyWidth: number, colorFn?: (s: string) => string): string[] {
-		const out: string[] = [];
-		for (const ln of text.split("\n")) {
-			const src = ln.length === 0 ? " " : ln;
-			const colored = colorFn ? colorFn(src) : src;
-			out.push(...wrapTextWithAnsi(colored, bodyWidth));
+	private async submit(value: string): Promise<void> {
+		if (this.closed || this.activeController) return;
+		const question = value.trim();
+		if (!question) return;
+		this.input.setValue("");
+		const turn: PopupTurn = { question, status: "pending" };
+		this.turns.push(turn);
+		this.scrollFromBottom = 0;
+		const controller = new AbortController();
+		this.activeController = controller;
+		this.requestRender();
+		try {
+			const result = await this.onSubmit(question, controller);
+			if (this.closed || controller.signal.aborted) return;
+			if (result.kind === "success") {
+				turn.status = "answer";
+				turn.answer = result.answer;
+				turn.trimmed = result.trimmed;
+			} else if (result.kind === "error") {
+				turn.status = "error";
+				turn.error = result.error;
+			} else {
+				this.turns = this.turns.filter((candidate) => candidate !== turn);
+			}
+			this.scrollFromBottom = 0;
+			this.requestRender();
+		} catch (error) {
+			if (!this.closed && !controller.signal.aborted) {
+				turn.status = "error";
+				turn.error = error instanceof Error ? error.message : String(error);
+				this.scrollFromBottom = 0;
+				this.requestRender();
+			}
+		} finally {
+			if (this.activeController === controller) this.activeController = undefined;
 		}
-		return out;
 	}
 
-	private renderAnswer(width: number): string[] {
-		const bodyWidth = Math.max(1, width - ANSWER_PAD.length);
-		const indent = (lines: string[]) => lines.map((l) => ANSWER_PAD + l);
+	private close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.activeController?.abort();
+		this.done();
+	}
 
-		if (this.mode === "pending") {
-			return indent([this.theme.fg("warning", PENDING_GLYPH)]);
+	private clearHistory(): void {
+		this.activeController?.abort();
+		this.turns = [];
+		this.markdown.clear();
+		this.scrollFromBottom = 0;
+		this.input.setValue("");
+		this.onClearHistory();
+		this.requestRender();
+	}
+
+	private renderTranscript(width: number): string[] {
+		const lines: string[] = [];
+		for (const turn of this.turns) {
+			lines.push(this.theme.fg("accent", "You"));
+			lines.push(...this.wrapPlain(`> ${turn.question}`, width, "accent"));
+			lines.push(this.theme.fg("muted", "BTW"));
+			if (turn.status === "pending") {
+				lines.push(this.theme.fg("warning", PENDING_TEXT));
+			} else if (turn.status === "error") {
+				lines.push(...this.wrapPlain(turn.error ?? "unknown error", width, "error"));
+			} else {
+				const markdown = this.getMarkdown(turn);
+				lines.push(...markdown.render(width));
+				if (turn.trimmed) lines.push(this.theme.fg("warning", TRIMMED_TEXT));
+			}
+			lines.push("");
 		}
-		if (this.mode === "error") {
-			return indent(this.wrapBodyLines(this.error, bodyWidth, (s) => this.theme.fg("error", s)));
+		return lines;
+	}
+
+	private getMarkdown(turn: PopupTurn): Markdown {
+		let markdown = this.markdown.get(turn);
+		if (!markdown) {
+			markdown = new Markdown(turn.answer ?? "", 0, 0, getMarkdownTheme());
+			this.markdown.set(turn, markdown);
+		} else {
+			markdown.setText(turn.answer ?? "");
 		}
-		return indent(this.wrapBodyLines(this.answer, bodyWidth));
+		return markdown;
+	}
+
+	private wrapPlain(text: string, width: number, color: "accent" | "error"): string[] {
+		return wrapTextWithAnsi(this.theme.fg(color, text), width);
+	}
+
+	private viewportRows(): number {
+		return Math.max(1, Math.max(MIN_POPUP_ROWS, Math.floor(this.terminalRows() * 0.9)) - 7);
+	}
+
+	private maxScroll(): number {
+		const innerWidth = Math.max(10, this.lastWidth - 2);
+		const bodyWidth = Math.max(10, innerWidth - POPUP_PADDING * 2);
+		return Math.max(0, this.renderTranscript(bodyWidth).length - this.viewportRows());
+	}
+
+	private terminalRows(): number {
+		return (this.tui.terminal as { rows?: number } | undefined)?.rows ?? 24;
+	}
+
+	private requestRender(): void {
+		this.tui.requestRender();
+	}
+
+	private headerText(width: number): string {
+		const text = `BTW · ${this.modelLabel}`;
+		return this.theme.fg("accent", truncateToWidth(text, width, "…"));
+	}
+
+	private boxRow(content: string, bodyWidth: number): string {
+		const padded =
+			truncateToWidth(content, bodyWidth, "") + " ".repeat(Math.max(0, bodyWidth - visibleWidth(content)));
+		return `│ ${padded} │`;
+	}
+
+	private divider(innerWidth: number): string {
+		return `├${"─".repeat(innerWidth)}┤`;
+	}
+
+	private topBorder(width: number): string {
+		const title = ` BTW · ${this.modelLabel} `;
+		const clipped = truncateToWidth(title, Math.max(1, width - 4), "…");
+		return `╭${clipped}${"─".repeat(Math.max(0, width - 2 - visibleWidth(clipped)))}╮`;
+	}
+
+	private bottomBorder(width: number): string {
+		return `╰${"─".repeat(Math.max(0, width - 2))}╯`;
 	}
 }
 
-export function showBtwOverlay(params: ShowBtwOverlayParams): ShowBtwOverlayResult {
-	let resolveReady!: (controller: BtwOverlayController) => void;
-	const controllerReady = new Promise<BtwOverlayController>((resolve) => {
-		resolveReady = resolve;
-	});
+export interface ShowBtwPopupParams {
+	ctx: ExtensionCommandContext;
+	initialQuestion?: string;
+	history: BtwTurn[];
+	modelLabel: string;
+	onSubmit: BtwPopupControllerOptions["onSubmit"];
+	onClearHistory: () => void;
+}
 
+export interface ShowBtwPopupResult {
+	overlayPromise: Promise<void>;
+	controllerReady: Promise<BtwPopupController>;
+}
+
+export function showBtwPopup(params: ShowBtwPopupParams): ShowBtwPopupResult {
+	let resolveController!: (controller: BtwPopupController) => void;
+	const controllerReady = new Promise<BtwPopupController>((resolve) => {
+		resolveController = resolve;
+	});
 	const overlayPromise = params.ctx.ui.custom<void>(
-		(tui, theme, _kb, done) => {
-			const controller = new BtwOverlayController(
-				params.question,
-				params.history,
+		(tui, theme, _keybindings, done) => {
+			const controller = new BtwPopupController({
+				initialQuestion: params.initialQuestion,
+				history: params.history,
+				modelLabel: params.modelLabel,
 				theme,
 				tui,
 				done,
-				params.controller,
-				params.onClearHistory,
-			);
-			resolveReady(controller);
+				onSubmit: params.onSubmit,
+				onClearHistory: params.onClearHistory,
+			});
+			resolveController(controller);
+			if (params.initialQuestion?.trim()) queueMicrotask(() => controller.startInitialQuestion());
 			return controller;
 		},
-		{ overlay: true, overlayOptions: BTW_OVERLAY_OPTIONS },
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "center",
+				width: POPUP_WIDTH,
+				maxHeight: POPUP_MAX_HEIGHT,
+				margin: 1,
+			},
+			onHandle: (handle) => handle.focus(),
+		},
 	);
-
 	return { overlayPromise, controllerReady };
 }

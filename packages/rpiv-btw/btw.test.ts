@@ -440,6 +440,66 @@ describe("executeBtw — overflow retry", () => {
 		expect(calls[1][1].messages).not.toBe(calls[0][1].messages);
 	});
 
+	it("uses a provider-reported prompt limit instead of blindly halving an oversized window", async () => {
+		const branchText = "x".repeat(2_400_000);
+		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage(branchText)]) });
+		ctx.model = { provider: "a", id: "m", contextWindow: 2_000_000, maxTokens: 128_000 } as never;
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(vi.fn(() => true) as never);
+		vi.mocked(completeSimple)
+			.mockResolvedValueOnce(
+				makeCompletionResponse({
+					stopReason: "error",
+					errorMessage: "This model's maximum prompt length is 500000 but the request contains 1047984 tokens.",
+				}) as never,
+			)
+			.mockResolvedValueOnce(makeCompletionResponse({ text: "retry answer" }) as never);
+
+		const result = await executeBtw("q", ctx, new AbortController());
+
+		expect(result.kind).toBe("success");
+		const calls = vi.mocked(completeSimple).mock.calls as Array<[unknown, { messages: unknown[] }, unknown]>;
+		expect(JSON.stringify(calls[1][1].messages).length).toBeLessThan(JSON.stringify(calls[0][1].messages).length);
+	});
+
+	it("parses comma-separated provider prompt limits even without the host overflow helper", async () => {
+		const branchText = "y".repeat(2_400_000);
+		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage(branchText)]) });
+		ctx.model = { provider: "a", id: "m", contextWindow: 2_000_000, maxTokens: 128_000 } as never;
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(undefined);
+		vi.mocked(completeSimple)
+			.mockResolvedValueOnce(
+				makeCompletionResponse({
+					stopReason: "error",
+					errorMessage: "This model's maximum prompt length is 500,000 but the request contains 523,992 tokens.",
+				}) as never,
+			)
+			.mockResolvedValueOnce(makeCompletionResponse({ text: "retry answer" }) as never);
+
+		const result = await executeBtw("q", ctx, new AbortController());
+
+		expect(result.kind).toBe("success");
+		expect(completeSimple).toHaveBeenCalledTimes(2);
+		const calls = vi.mocked(completeSimple).mock.calls as Array<[unknown, { messages: unknown[] }, unknown]>;
+		expect(JSON.stringify(calls[1][1].messages).length).toBeLessThan(JSON.stringify(calls[0][1].messages).length);
+		expect((calls[1][0] as { contextWindow: number }).contextWindow).toBe(594_384);
+	});
+
+	it("does not retry a successful response that happens to include an error message", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;
+		const overflowFn = vi.fn(() => true);
+		vi.mocked(loadIsContextOverflow).mockResolvedValue(overflowFn as never);
+		vi.mocked(completeSimple).mockResolvedValueOnce(
+			makeCompletionResponse({ text: "answer", errorMessage: "maximum prompt length is 500000" }) as never,
+		);
+
+		const result = await executeBtw("q", ctx, new AbortController());
+
+		expect(result.kind).toBe("success");
+		expect(completeSimple).toHaveBeenCalledOnce();
+		expect(overflowFn).not.toHaveBeenCalled();
+	});
+
 	it("does not retry when the first call is aborted (aborted arm, single call)", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "a", id: "m", contextWindow: 8192 } as never;

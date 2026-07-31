@@ -1,26 +1,22 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { createMockCtx, createMockPi } from "@juicesharp/rpiv-test-utils";
+import { buildSessionEntries, createMockCtx, createMockPi, makeUserMessage } from "@juicesharp/rpiv-test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./btw-ui.js", () => ({
-	showBtwOverlay: vi.fn(),
+	showBtwPopup: vi.fn(),
 }));
 
 vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("@earendil-works/pi-ai")>();
+	const actual = await importOriginal<Record<string, unknown>>();
 	return {
 		...actual,
 		getSupportedThinkingLevels: vi.fn(() => ["off", "minimal", "low", "medium", "high"]),
 	};
 });
 
-// completeSimple lives on /compat since pi 0.80 (see test/setup.ts).
 vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("@earendil-works/pi-ai/compat")>();
-	return {
-		...actual,
-		completeSimple: vi.fn(),
-	};
+	const actual = await importOriginal<Record<string, unknown>>();
+	return { ...actual, completeSimple: vi.fn() };
 });
 
 vi.mock("./config.js", () => ({
@@ -29,25 +25,20 @@ vi.mock("./config.js", () => ({
 
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { BTW_COMMAND_NAME, BTW_STATE_KEY, registerBtwCommand } from "./btw.js";
-import { showBtwOverlay } from "./btw-ui.js";
+import { showBtwPopup } from "./btw-ui.js";
 import { loadBtwConfig } from "./config.js";
 
-const model = { provider: "a", id: "m" } as unknown as Model<Api>;
+const model = { provider: "a", id: "m", contextWindow: 200000, maxTokens: 8192 } as unknown as Model<Api>;
+const configured = {
+	provider: "cliproxyapi",
+	id: "gpt-5.6-sol",
+	name: "GPT 5.6 Sol",
+	reasoning: true,
+	contextWindow: 200000,
+	maxTokens: 8192,
+} as unknown as Model<Api>;
 
-type OverlayCtl = {
-	setAnswer: ReturnType<typeof vi.fn>;
-	setError: ReturnType<typeof vi.fn>;
-	setTrimmed: ReturnType<typeof vi.fn>;
-};
-
-function stubOverlay(): OverlayCtl {
-	const ctl: OverlayCtl = { setAnswer: vi.fn(), setError: vi.fn(), setTrimmed: vi.fn() };
-	vi.mocked(showBtwOverlay).mockReturnValueOnce({
-		overlayPromise: Promise.resolve(),
-		controllerReady: Promise.resolve(ctl as never),
-	} as never);
-	return ctl;
-}
+type PopupParams = Parameters<typeof showBtwPopup>[0];
 
 function doneResponse(text: string) {
 	return {
@@ -58,8 +49,26 @@ function doneResponse(text: string) {
 	};
 }
 
+function register() {
+	const { pi, captured } = createMockPi();
+	registerBtwCommand(pi);
+	return captured.commands.get(BTW_COMMAND_NAME)!;
+}
+
+function stubPopup(interaction: (params: PopupParams) => Promise<void> = async () => {}) {
+	let params!: PopupParams;
+	vi.mocked(showBtwPopup).mockImplementationOnce((next) => {
+		params = next;
+		return {
+			overlayPromise: interaction(next),
+			controllerReady: Promise.resolve({} as never),
+		};
+	});
+	return () => params;
+}
+
 beforeEach(() => {
-	vi.mocked(showBtwOverlay).mockReset();
+	vi.mocked(showBtwPopup).mockReset();
 	vi.mocked(completeSimple).mockReset();
 	vi.mocked(loadBtwConfig).mockReset().mockReturnValue({});
 });
@@ -68,145 +77,95 @@ afterEach(() => {
 	delete (globalThis as Record<symbol, unknown>)[BTW_STATE_KEY];
 });
 
-function register() {
-	const { pi, captured } = createMockPi();
-	registerBtwCommand(pi);
-	return captured.commands.get(BTW_COMMAND_NAME)!;
-}
-
-describe("/btw — early-return branches", () => {
-	it("!hasUI notifies error and skips overlay", async () => {
+describe("/btw command", () => {
+	it("requires interactive mode", async () => {
 		const cmd = register();
 		const ctx = createMockCtx({ hasUI: false, model });
 		await cmd.handler("anything", ctx as never);
 		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("interactive"), "error");
-		expect(showBtwOverlay).not.toHaveBeenCalled();
+		expect(showBtwPopup).not.toHaveBeenCalled();
 	});
 
-	it("empty question emits usage warning", async () => {
+	it("opens an empty popup when no question is provided", async () => {
+		stubPopup();
 		const cmd = register();
-		const ctx = createMockCtx({ hasUI: true, model });
-		await cmd.handler("   ", ctx as never);
-		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Usage"), "warning");
-		expect(showBtwOverlay).not.toHaveBeenCalled();
+		await cmd.handler("   ", createMockCtx({ hasUI: true, model }) as never);
+		expect(showBtwPopup).toHaveBeenCalledOnce();
+		expect(vi.mocked(showBtwPopup).mock.calls[0][0].initialQuestion).toBeUndefined();
 	});
 
-	it("missing model notifies error", async () => {
-		const cmd = register();
-		const ctx = createMockCtx({ hasUI: true });
-		await cmd.handler("hello?", ctx as never);
-		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("active model"), "error");
-		expect(showBtwOverlay).not.toHaveBeenCalled();
-	});
-});
-
-describe("/btw — happy path", () => {
-	it("invokes overlay, awaits executor, pipes answer to setAnswer", async () => {
-		const ctl = stubOverlay();
+	it("opens with an initial question and submits it immediately", async () => {
 		vi.mocked(completeSimple).mockResolvedValueOnce(doneResponse("42") as never);
+		const getParams = stubPopup(async (params) => {
+			await params.onSubmit(params.initialQuestion!, new AbortController());
+		});
+		const cmd = register();
+		await cmd.handler("what is 6 times 7?", createMockCtx({ hasUI: true, model }) as never);
+		const params = getParams();
+		expect(params.initialQuestion).toBe("what is 6 times 7?");
+		expect(completeSimple).toHaveBeenCalledWith(model, expect.anything(), expect.anything());
+	});
+
+	it("passes the effective model and reasoning label to the popup", async () => {
+		vi.mocked(loadBtwConfig).mockReturnValue({ modelKey: "cliproxyapi/gpt-5.6-sol", effort: "high" });
+		stubPopup();
+		const cmd = register();
+		await cmd.handler("question", createMockCtx({ hasUI: true, model, models: [configured] }) as never);
+		expect(vi.mocked(showBtwPopup).mock.calls[0][0].modelLabel).toContain("cliproxyapi/gpt-5.6-sol");
+		expect(vi.mocked(showBtwPopup).mock.calls[0][0].modelLabel).toContain("high");
+	});
+
+	it("pushes each successful popup follow-up exactly once and includes prior BTW turns once", async () => {
+		vi.mocked(completeSimple)
+			.mockResolvedValueOnce(doneResponse("first answer") as never)
+			.mockResolvedValueOnce(doneResponse("second answer") as never);
+		stubPopup(async (params) => {
+			await params.onSubmit("first question", new AbortController());
+			await params.onSubmit("second question", new AbortController());
+		});
+		const cmd = register();
+		const ctx = createMockCtx({ hasUI: true, model, branch: buildSessionEntries([makeUserMessage("branch")]) });
+		await cmd.handler("first question", ctx as never);
+		const secondMessages = JSON.stringify(vi.mocked(completeSimple).mock.calls[1][1].messages);
+		expect(secondMessages.match(/first question/g)).toHaveLength(1);
+		expect(secondMessages.match(/first answer/g)).toHaveLength(1);
+		const state = (globalThis as Record<symbol, { histories: Map<string, unknown[]> }>)[BTW_STATE_KEY];
+		expect(state.histories.get("/tmp/test-session.jsonl")).toHaveLength(2);
+	});
+
+	it("returns popup errors without appending history", async () => {
+		let result!: unknown;
+		const getParams = stubPopup(async (params) => {
+			result = await params.onSubmit("bad question", new AbortController());
+		});
+		const cmd = register();
+		await cmd.handler("bad question", createMockCtx({ hasUI: true, model }) as never);
+		expect(result).toEqual({ kind: "error", error: expect.stringContaining("call") });
+		expect(getParams()).toBeDefined();
+	});
+
+	it("does not persist a result after the popup aborts its controller", async () => {
+		vi.mocked(completeSimple).mockResolvedValueOnce(doneResponse("late answer") as never);
+		const getParams = stubPopup(async (params) => {
+			const controller = new AbortController();
+			controller.abort();
+			const result = await params.onSubmit("aborted question", controller);
+			expect(result).toEqual({ kind: "aborted" });
+		});
 		const cmd = register();
 		const ctx = createMockCtx({ hasUI: true, model });
-		await cmd.handler("what is 6 times 7?", ctx as never);
-		expect(showBtwOverlay).toHaveBeenCalledTimes(1);
-		const params = vi.mocked(showBtwOverlay).mock.calls[0][0];
-		expect(params.question).toBe("what is 6 times 7?");
-		expect(params.history).toEqual([]);
-		expect(ctl.setAnswer).toHaveBeenCalledWith("42");
-		expect(ctl.setError).not.toHaveBeenCalled();
-		expect(ctl.setTrimmed).not.toHaveBeenCalled();
-		expect(completeSimple).toHaveBeenCalledWith(
-			model,
-			expect.anything(),
-			expect.objectContaining({ reasoning: "medium" }),
-		);
-	});
-});
-
-describe("configured model", () => {
-	const configured = {
-		provider: "cliproxyapi",
-		id: "gpt-5.6-sol",
-		name: "GPT 5.6 Sol",
-		reasoning: true,
-	} as unknown as Model<Api>;
-
-	it("uses the persisted model and reasoning level", async () => {
-		vi.mocked(loadBtwConfig).mockReturnValue({
-			modelKey: "cliproxyapi/gpt-5.6-sol",
-			effort: "high",
-		});
-		stubOverlay();
-		vi.mocked(completeSimple).mockResolvedValueOnce(doneResponse("configured") as never);
-		const cmd = register();
-		const ctx = createMockCtx({ hasUI: true, model, models: [configured] });
-		await cmd.handler("question", ctx as never);
-		expect(completeSimple).toHaveBeenCalledWith(
-			configured,
-			expect.anything(),
-			expect.objectContaining({ reasoning: "high" }),
-		);
+		await cmd.handler("aborted question", ctx as never);
+		const state = (globalThis as Record<symbol, { histories: Map<string, unknown[]> }>)[BTW_STATE_KEY];
+		expect(state.histories.get("/tmp/test-session.jsonl") ?? []).toHaveLength(0);
+		expect(getParams()).toBeDefined();
 	});
 
-	it("reports an unavailable configured model before opening the overlay", async () => {
+	it("does not open when a configured model is unavailable", async () => {
 		vi.mocked(loadBtwConfig).mockReturnValue({ modelKey: "missing/model", effort: "medium" });
 		const cmd = register();
 		const ctx = createMockCtx({ hasUI: true, model, models: [configured] });
 		await cmd.handler("question", ctx as never);
 		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("no longer available"), "error");
-		expect(showBtwOverlay).not.toHaveBeenCalled();
-		expect(completeSimple).not.toHaveBeenCalled();
-	});
-});
-
-describe("/btw — aborted", () => {
-	it("does not touch the overlay controller", async () => {
-		const ctl = stubOverlay();
-		vi.mocked(completeSimple).mockResolvedValueOnce({
-			role: "assistant",
-			content: [],
-			timestamp: Date.now(),
-			stopReason: "aborted",
-		} as never);
-		const cmd = register();
-		const ctx = createMockCtx({ hasUI: true, model });
-		await cmd.handler("q", ctx as never);
-		expect(ctl.setAnswer).not.toHaveBeenCalled();
-		expect(ctl.setError).not.toHaveBeenCalled();
-	});
-});
-
-describe("/btw — executor failure", () => {
-	it("pipes error into setError", async () => {
-		const ctl = stubOverlay();
-		vi.mocked(completeSimple).mockResolvedValueOnce({
-			role: "assistant",
-			content: [],
-			timestamp: Date.now(),
-			stopReason: "error",
-			errorMessage: "upstream 502",
-		} as never);
-		const cmd = register();
-		const ctx = createMockCtx({ hasUI: true, model });
-		await cmd.handler("q", ctx as never);
-		expect(ctl.setError).toHaveBeenCalledWith(expect.stringContaining("upstream 502"));
-		expect(ctl.setAnswer).not.toHaveBeenCalled();
-	});
-});
-
-describe("/btw — cross-session hint is rendered after turns accumulate", () => {
-	it("second invocation's systemPrompt contains the recent-questions section", async () => {
-		stubOverlay();
-		vi.mocked(completeSimple).mockResolvedValueOnce(doneResponse("ans1") as never);
-		const cmd = register();
-		const ctx = createMockCtx({ hasUI: true, model });
-		await cmd.handler("first question", ctx as never);
-
-		stubOverlay();
-		vi.mocked(completeSimple).mockResolvedValueOnce(doneResponse("ans2") as never);
-		await cmd.handler("second question", ctx as never);
-
-		const secondSystemPrompt = vi.mocked(completeSimple).mock.calls[1][1].systemPrompt ?? "";
-		expect(secondSystemPrompt).toContain("Recent /btw questions across sessions");
-		expect(secondSystemPrompt).toContain("first question");
+		expect(showBtwPopup).not.toHaveBeenCalled();
 	});
 });

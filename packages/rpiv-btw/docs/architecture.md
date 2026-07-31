@@ -1,164 +1,123 @@
 # rpiv-btw architecture
 
-Module layout, what the extension registers with Pi, how the overlay is laid out,
-how state is stored, and how the package tolerates different Pi host versions.
+`rpiv-btw` registers a focused, centered conversational popup for side questions.
+The popup owns presentation and input; `btw.ts` owns model execution and
+process-scoped history.
 
 ## Modules
 
 ```
 rpiv-btw/
 ├── index.ts             — extension entry; registers commands + lifecycle hooks
-├── btw.ts               — state, snapshotting, message threading, effective-model call
+├── btw.ts               — state, snapshots, model resolution, execution, history
+├── btw-messages.ts      — BtwTurn and message-text helpers
+├── btw-budget.ts        — pure context fitting and token budgets
 ├── btw-settings.ts      — global model/reasoning picker
 ├── config.ts            — validated XDG-aware settings persistence
-├── btw-ui.ts            — bottom-anchored overlay component and key handling
+├── btw-ui.ts            — centered persistent popup, Input, Markdown, scrolling
 ├── pi-compat.ts         — host-version-tolerant completion/runtime bridge
 └── prompts/
     └── btw-system.txt   — system prompt for the side call
 ```
 
-Pi discovers the extension through the manifest block in `package.json`:
+The package ships raw TypeScript through the manifest:
 
 ```json
 "pi": { "extensions": ["./index.ts"] }
 ```
 
-That is the entire registration surface. The package ships no skills, no agents,
-no `bin`, and declares no `exports` or `main`. A test (`ship-manifest.test.ts`)
-asserts that the published `files` list covers every production module.
+No skills, agents, CLI flags, or tools are registered.
 
-## What gets registered
+## Commands and hooks
 
-Two slash commands:
-
-| Command | Description string |
+| Command | Behavior |
 | --- | --- |
-| `/btw <question>` | `Ask a side question without polluting the main conversation` |
-| `/btw-settings` | `Configure the global model and reasoning level used by /btw` |
-
-Three lifecycle hooks:
+| `/btw` | Opens an empty focused popup after model validation |
+| `/btw <question>` | Opens the popup and submits the initial question |
+| `/btw-settings` | Configures the global model and reasoning level |
 
 | Event | Behavior |
 | --- | --- |
-| `message_end` | Snapshots the branch, only for assistant messages whose `stopReason` is not `toolUse` |
-| `session_compact` | Invalidates this session's cached snapshot |
-| `session_tree` | Invalidates this session's cached snapshot |
+| `message_end` | Snapshots the branch after completed assistant messages |
+| `session_compact` | Invalidates the cached branch snapshot |
+| `session_tree` | Invalidates the cached branch snapshot |
 
-No tools are registered. No CLI flags are added.
+`/btw` never calls or mutates main-session compaction.
 
-## State
+## Popup ownership
 
-All state lives on a single process-wide cell:
-
-```ts
-export const BTW_STATE_KEY = Symbol.for("rpiv-btw");
-```
-
-It holds two maps — `histories` and `snapshots` — both keyed by
-`ctx.sessionManager.getSessionFile()`, with `memory:<sessionId>` as the fallback
-key when there is no session file.
-
-Using `globalThis` plus `Symbol.for()` (the same idiom OpenTelemetry uses for
-cross-import-graph singletons) means the cell survives module re-import, so
-`/btw` history outlives `/new`, `/fork`, `/resume`, and `/reload`. It is lost
-when the Pi process exits. Separately, `/btw-settings` persists only its model
-and reasoning override under the XDG-aware `rpiv-btw/config.json` path.
-
-## Overlay
-
-`showBtwOverlay` mounts a `Component` through `ctx.ui.custom` with these options:
+`showBtwPopup` mounts `BtwPopupController` through `ctx.ui.custom` with:
 
 | Option | Value |
 | --- | --- |
-| `anchor` | `bottom-center` |
-| `width` | `100%` |
-| `maxHeight` | `85%` (`BTW_MAX_HEIGHT_RATIO = 0.85`) |
-| `margin` | `{ left: 0, right: 0, bottom: 0 }` |
+| `anchor` | `center` |
+| `width` | `90%` |
+| `maxHeight` | `90%` |
+| `margin` | `1` |
 
-Render order, top to bottom:
+The controller implements `Component` and `Focusable`. It owns one native
+`Input`, propagates focus to it, and delegates arrows, editing, paste, Enter,
+and IME input to that Input. It intercepts only:
 
-```
-banner        — your question on a themed stripe, padded to full width
-(blank)
-history       — prior "/btw <q>" lines for this session
-echo          — "/btw <q>" for the current question
-(blank)
-answer        — "…" while pending, the answer text, or the error in red
-(blank)
-footer        — key hints
-```
-
-History and echo use a 2-column left gutter; the answer body uses 4. The panel
-grows upward with content. When the natural height exceeds
-`floor(terminalRows × 0.85)` (terminal rows default to 24 if unknown, with a
-floor of 4 rows), it clips from the top and `↑`/`↓` scroll that window —
-offset `0` shows the newest content.
-
-### Keys and footer gates
-
-| Key | Action | Matching |
-| --- | --- | --- |
-| `Esc` | Aborts the in-flight call and dismisses the overlay | `matchesKey` (ANSI + Kitty) |
-| `↑` | Scroll up one row, clamped at 0 | `matchesKey` |
-| `↓` | Scroll down one row, clamped to the overflow amount | `matchesKey` |
-| `x` | Clears this session's `/btw` history and resets scroll | raw `data === "x"` — uppercase `X` is not bound |
-
-| Footer hint | Shown when |
+| Key | Action |
 | --- | --- |
-| `↑/↓ to scroll` | the call is no longer pending (an answer or error has arrived) |
-| `x to clear history` | this session has at least one prior `/btw` turn |
-| `Esc to dismiss` | always |
+| `Escape` | Abort the active request and close |
+| `PageUp` / `PageDown` | Move transcript by one viewport, clamped |
+| `Ctrl+L` | Clear local transcript and process-scoped history |
 
-Hints are joined with `" · "` and truncated to the panel width.
+The transcript is rendered with native `Markdown` and `getMarkdownTheme()`. Each
+submitted question gets a pending row; the same row becomes an answer or error.
+Only one request may be active. Every submission receives a fresh
+`AbortController`, and a late result after close is ignored. The footer is:
 
-## Host-version tolerance
+`Enter send · PgUp/PgDn scroll · Ctrl+L clear · Esc close`
 
-pi-ai resolves at runtime against the *host's* copy (all three pi peers are
-declared `"*"`), and pi moved the global dispatch API to a `/compat` entrypoint
-in 0.80.1. `pi-compat.ts` therefore resolves `completeSimple` lazily:
+Scroll is stored as rows from the bottom: zero is newest. New submissions and
+completed requests return to the newest content. Fixed header/input/footer rows
+are excluded from the transcript viewport, including on short terminals.
 
-1. `import("@earendil-works/pi-ai/compat")` — pi >= 0.80.1.
-2. On a **module-resolution** failure only, fall back to
-   `import("@earendil-works/pi-ai")` — pi <= 0.79.x, which has no `/compat`
-   subpath at all.
+## Command and execution flow
 
-The fallback is gated on the error codes `ERR_PACKAGE_PATH_NOT_EXPORTED`,
-`ERR_MODULE_NOT_FOUND`, and `MODULE_NOT_FOUND`, walked down the `cause` chain
-(bounded at 16 links, because ESM loaders and test mock layers nest the real
-code). Any other `/compat` error — the entrypoint exists but throws at module
-init — rethrows, so a real failure surfaces instead of being masked by a root
-import that may not have the export.
+1. Validate interactive UI and resolve the effective model/reasoning.
+2. Snapshot existing successful BTW history once.
+3. Mount one popup, passing its model label, snapshot, callbacks, and optional initial question.
+4. For each submission, call `executeBtw` with the popup's controller.
+5. On success, append the returned real `UserMessage` and `AssistantMessage` exactly once.
+6. Return the answer/error to the popup; errors keep it open and aborts do not persist.
 
-If neither entrypoint exposes the function, the call fails with
-`pi-ai does not expose completeSimple on /compat or the package root — unsupported host pi-ai version`.
+The popup does not know about models, credentials, branch snapshots, or history
+storage. History is process-scoped and non-persistent.
 
-`/compat` is documented upstream as temporary, so this module is the single place
-to migrate when it is removed.
+## Context fitting and retry
 
-## Messages and errors
+The request contains the branch snapshot, successful BTW turns, and the new
+question. `btw-budget.ts` preserves the compacted branch summary and fits older
+content without triggering compaction.
 
-Every user-visible string the package can produce:
+If the first provider response is an error reporting `maximum prompt length is
+500000` or `500,000`, the numeric cap is parsed, reduced by 10%, and used to
+build a temporary model context window targeting that prompt limit. The request
+is rebuilt from the unchanged source snapshot and retried once. If no numeric cap
+is available but the host overflow helper recognizes the error, the existing
+half-budget fallback is used. A second overflow is returned as an error; there
+is never a third completion call.
+
+## Host compatibility
+
+`pi-compat.ts` lazily prefers the auth-aware runtime facade and preserves the
+legacy `completeSimple()` fallback for older Pi hosts. Pi 0.80.5 peer APIs are
+the compile target; live Pi 0.83 adds scoped model selection without changing the
+fallback behavior. No private selector or session-manager API is imported.
+
+## User-visible errors
 
 | String | When |
 | --- | --- |
-| `/btw requires interactive mode` (error) | `ctx.hasUI` is false — `pi --print`, RPC |
-| `Usage: /btw <question>` (warning) | the argument is empty or whitespace-only |
-| `/btw requires an active model` (error) | follow-session mode has no `ctx.model` |
-| `Configured /btw model <key> is no longer available; run /btw-settings` | persisted model lookup failed |
-| `/btw model (<provider>:<id>) is misconfigured: <err>` | credential lookup returned an error |
-| `/btw model (<provider>:<id>) has no API key available.` | lookup succeeded but the API key is empty |
-| `/btw call failed: <err ?? "unknown error">` | the completion returned `stopReason: "error"` |
-| `/btw call threw: <message>` | the completion threw and the call was not aborted |
-| `/btw returned no text content.` | the response contained no text parts |
-
-The first three are `ctx.ui.notify` toasts raised before the overlay opens; the
-rest render inside the overlay in the error style.
-
-## Boundaries
-
-- **One runtime dependency.** `@juicesharp/rpiv-config` owns secure XDG-aware JSON
-  persistence and the model-key codec; the three Pi packages remain peer dependencies.
-- **No duplicated config layer.** Model-key parsing and file permissions reuse the
-  existing sibling utility instead of adding package-local filesystem code.
-- **Standalone.** rpiv-btw is excluded from `rpiv-pi`'s auto-install sibling list,
-  and a test asserts that exclusion.
+| `/btw requires interactive mode` | No popup UI is available |
+| `/btw requires an active model` | Follow-session mode has no model |
+| `Configured /btw model <key> is no longer available; run /btw-settings` | Persisted model lookup failed |
+| `/btw model (<provider>:<id>) is misconfigured: <err>` | Credential lookup failed |
+| `/btw model (<provider>:<id>) has no API key available.` | Credential lookup returned no key |
+| `/btw call failed: <err>` | Completion returned an error |
+| `/btw call threw: <message>` | Completion threw without abort |
+| `/btw returned no text content.` | Response contained no text parts |

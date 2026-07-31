@@ -1,9 +1,28 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
-import { makeTui } from "@juicesharp/rpiv-test-utils";
+import { CURSOR_MARKER, Input, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { BtwTurn } from "./btw.js";
-import { BtwOverlayController, showBtwOverlay } from "./btw-ui.js";
+import type { BtwTurn } from "./btw-messages.js";
+import { BtwPopupController, type BtwPopupSubmitResult, showBtwPopup } from "./btw-ui.js";
+
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => ({
+	...(await importOriginal<Record<string, unknown>>()),
+	getMarkdownTheme: () => ({
+		heading: (text: string) => text,
+		link: (text: string) => text,
+		linkUrl: (text: string) => text,
+		code: (text: string) => text,
+		codeBlock: (text: string) => text,
+		codeBlockBorder: (text: string) => text,
+		quote: (text: string) => text,
+		quoteBorder: (text: string) => text,
+		hr: (text: string) => text,
+		listBullet: (text: string) => text,
+		bold: (text: string) => text,
+		italic: (text: string) => text,
+		strikethrough: (text: string) => text,
+		underline: (text: string) => text,
+	}),
+}));
 
 const identityTheme = {
 	fg: (_c: string, s: string) => s,
@@ -12,7 +31,11 @@ const identityTheme = {
 	strikethrough: (s: string) => s,
 } as unknown as Theme;
 
-function makeTurn(q: string, a = "ans"): BtwTurn {
+function makeTui(rows = 24): TUI {
+	return { requestRender: vi.fn(), terminal: { rows, columns: 100 } } as unknown as TUI;
+}
+
+function makeTurn(q: string, a = "answer"): BtwTurn {
 	return {
 		userMessage: { role: "user", content: q, timestamp: 0 },
 		assistantMessage: {
@@ -28,263 +51,171 @@ function makeTurn(q: string, a = "ans"): BtwTurn {
 	};
 }
 
-function makeController(opts: { question?: string; history?: BtwTurn[]; tui?: TUI; rows?: number } = {}) {
-	const tui = opts.tui ?? (makeTui() as unknown as TUI);
-	(tui as unknown as { terminal: { rows: number } }).terminal = { rows: opts.rows ?? 24 };
+function makeController(
+	opts: {
+		history?: BtwTurn[];
+		initialQuestion?: string;
+		rows?: number;
+		onSubmit?: (question: string, controller: AbortController) => Promise<BtwPopupSubmitResult>;
+	} = {},
+) {
+	const tui = makeTui(opts.rows);
 	const done = vi.fn();
-	const controller = new AbortController();
+	const onSubmit = opts.onSubmit ?? vi.fn(async () => ({ kind: "success", answer: "answer" }) as BtwPopupSubmitResult);
 	const onClearHistory = vi.fn();
-	const ctl = new BtwOverlayController(
-		opts.question ?? "what?",
-		opts.history ?? [],
-		identityTheme,
+	const ctl = new BtwPopupController({
+		initialQuestion: opts.initialQuestion,
+		history: opts.history ?? [],
+		modelLabel: "cliproxyapi/gpt-5.6-sol · medium",
+		theme: identityTheme,
 		tui,
 		done,
-		controller,
+		onSubmit,
 		onClearHistory,
-	);
-	return { ctl, tui, done, controller, onClearHistory };
+	});
+	return { ctl, tui, done, onSubmit, onClearHistory };
 }
 
-afterEach(() => {
-	vi.restoreAllMocks();
-});
+afterEach(() => vi.restoreAllMocks());
 
-describe("BtwOverlayController — initial (pending) render", () => {
-	it("contains the banner, echo line, pending glyph, and dismiss footer", () => {
-		const { ctl } = makeController({ question: "hello?" });
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("/btw hello?");
-		expect(out).toContain("…"); // PENDING_GLYPH
-		expect(out).toContain("Esc to dismiss");
-	});
-
-	it("does NOT show 'scroll' or 'clear' hints when pending + no history", () => {
-		const { ctl } = makeController({ question: "q" });
-		const out = ctl.render(80).join("\n");
-		expect(out).not.toContain("↑/↓ to scroll");
-		expect(out).not.toContain("x to clear history");
-	});
-
-	it("shows 'x to clear history' hint when history is non-empty", () => {
-		const { ctl } = makeController({ history: [makeTurn("prev")] });
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("x to clear history");
-	});
-});
-
-describe("BtwOverlayController — setAnswer", () => {
-	it("replaces pending glyph with the answer text", () => {
-		const { ctl, tui } = makeController();
-		ctl.setAnswer("forty-two");
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("forty-two");
-		expect(out).not.toContain("…");
-		expect(tui.requestRender).toHaveBeenCalled();
-	});
-
-	it("enables the 'scroll' footer hint once the mode is no longer pending", () => {
+describe("BtwPopupController shell", () => {
+	it("renders a centered-popup header, empty focused input, and controls", () => {
 		const { ctl } = makeController();
-		ctl.setAnswer("a");
-		expect(ctl.render(80).join("\n")).toContain("↑/↓ to scroll");
+		ctl.focused = true;
+		const output = ctl.render(80).join("\n");
+		expect(output).toContain("BTW");
+		expect(output).toContain("cliproxyapi/gpt-5.6-sol · medium");
+		expect(output).toContain("Enter send");
+		expect(output).toContain(CURSOR_MARKER);
 	});
 
-	it("wraps multi-line answers into the answer body", () => {
-		const { ctl } = makeController();
-		ctl.setAnswer("line1\nline2\nline3");
-		const out = ctl.render(80);
-		expect(out.some((l) => l.includes("line1"))).toBe(true);
-		expect(out.some((l) => l.includes("line2"))).toBe(true);
-		expect(out.some((l) => l.includes("line3"))).toBe(true);
-	});
-});
-
-describe("BtwOverlayController — setError", () => {
-	it("renders the error message in the answer slot", () => {
-		const { ctl } = makeController();
-		ctl.setError("boom: nope");
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("boom: nope");
-		expect(out).not.toContain("…");
+	it("renders prior successful turns as distinct user and assistant content", () => {
+		const { ctl } = makeController({ history: [makeTurn("previous question", "**previous answer**")] });
+		const output = ctl.render(100).join("\n");
+		expect(output).toContain("previous question");
+		expect(output).toContain("previous answer");
+		expect(output).not.toContain("**previous answer**");
 	});
 });
 
-describe("BtwOverlayController — setTrimmed", () => {
-	it("appends exactly one notice line and triggers requestRender", () => {
-		const { ctl, tui } = makeController({ rows: 100 });
-		ctl.setAnswer("answer-body");
-		const beforeLines = ctl.render(80).length; // 7 (un-trimmed parity)
-		ctl.setTrimmed();
-		const afterLines = ctl.render(80);
-		expect(afterLines.length).toBe(beforeLines + 1); // 8 — exactly one more line
-		expect(afterLines.join("\n")).toContain("context trimmed to fit budget");
-		expect(tui.requestRender).toHaveBeenCalled();
+describe("BtwPopupController input and requests", () => {
+	it("submits a complete multi-word question once", async () => {
+		const deferred = Promise.resolve({ kind: "success", answer: "ok" } as BtwPopupSubmitResult);
+		const { ctl, onSubmit } = makeController({ onSubmit: vi.fn(async () => deferred) });
+		for (const char of "what is this") ctl.handleInput(char);
+		ctl.handleInput("\r");
+		await deferred;
+		expect(onSubmit).toHaveBeenCalledOnce();
+		expect(onSubmit).toHaveBeenCalledWith("what is this", expect.any(AbortController));
 	});
 
-	it("is a no-op on the un-trimmed path (line count unchanged)", () => {
-		const { ctl } = makeController({ rows: 100 });
-		ctl.setAnswer("answer-body");
-		// setTrimmed never called — render stays at the un-trimmed line count
-		expect(ctl.render(80).length).toBe(7);
+	it("does not submit a second request while one is pending", async () => {
+		let resolve!: (result: BtwPopupSubmitResult) => void;
+		const onSubmit = vi.fn(() => new Promise<BtwPopupSubmitResult>((r) => (resolve = r)));
+		const { ctl } = makeController({ onSubmit });
+		for (const char of "first") ctl.handleInput(char);
+		ctl.handleInput("\r");
+		for (const char of "second") ctl.handleInput(char);
+		ctl.handleInput("\r");
+		expect(onSubmit).toHaveBeenCalledOnce();
+		resolve({ kind: "success", answer: "done" });
+		await vi.waitFor(() => expect(ctl.render(80).join("\n")).toContain("done"));
 	});
-});
 
-describe("BtwOverlayController — handleInput", () => {
-	it("Esc aborts the controller and resolves done()", () => {
-		const { ctl, controller, done } = makeController();
+	it("keeps errors visible and accepts a later follow-up", async () => {
+		const onSubmit = vi
+			.fn<(_: string, __: AbortController) => Promise<BtwPopupSubmitResult>>()
+			.mockResolvedValueOnce({ kind: "error", error: "upstream failed" })
+			.mockResolvedValueOnce({ kind: "success", answer: "recovered" });
+		const { ctl } = makeController({ onSubmit });
+		for (const char of "first") ctl.handleInput(char);
+		ctl.handleInput("\r");
+		await vi.waitFor(() => expect(ctl.render(80).join("\n")).toContain("upstream failed"));
+		for (const char of "second") ctl.handleInput(char);
+		ctl.handleInput("\r");
+		await vi.waitFor(() => expect(ctl.render(80).join("\n")).toContain("recovered"));
+		expect(onSubmit).toHaveBeenCalledTimes(2);
+	});
+
+	it("aborts the active request and closes on Escape", () => {
+		let requestController!: AbortController;
+		const onSubmit = vi.fn((_question: string, controller: AbortController) => {
+			requestController = controller;
+			return new Promise<BtwPopupSubmitResult>(() => {});
+		});
+		const { ctl, done } = makeController({ onSubmit });
+		for (const char of "pending") ctl.handleInput(char);
+		ctl.handleInput("\r");
 		ctl.handleInput("\u001b");
-		expect(controller.signal.aborted).toBe(true);
-		expect(done).toHaveBeenCalled();
+		expect(requestController.signal.aborted).toBe(true);
+		expect(done).toHaveBeenCalledOnce();
 	});
 
-	it("'x' clears in-memory history and invokes onClearHistory", () => {
-		const { ctl, onClearHistory, tui } = makeController({ history: [makeTurn("a"), makeTurn("b")] });
-		ctl.handleInput("x");
-		expect(onClearHistory).toHaveBeenCalledTimes(1);
-		const out = ctl.render(80).join("\n");
-		expect(out).not.toContain("/btw a");
-		expect(out).not.toContain("/btw b");
-		expect(out).not.toContain("x to clear history");
-		expect(tui.requestRender).toHaveBeenCalled();
-	});
-
-	it("unknown keys do not abort or clear", () => {
-		const { ctl, controller, done, onClearHistory } = makeController();
-		ctl.handleInput("z");
-		expect(controller.signal.aborted).toBe(false);
+	it("clears transcript and process history without closing", () => {
+		const { ctl, onClearHistory, done } = makeController({ history: [makeTurn("old", "old answer")] });
+		ctl.handleInput("\u000c");
+		expect(onClearHistory).toHaveBeenCalledOnce();
 		expect(done).not.toHaveBeenCalled();
-		expect(onClearHistory).not.toHaveBeenCalled();
+		expect(ctl.render(100).join("\n")).not.toContain("old answer");
 	});
 });
 
-describe("BtwOverlayController — scroll + clipping", () => {
-	it("render() returns all natural lines when within maxRows", () => {
-		const { ctl } = makeController({ rows: 100 });
-		ctl.setAnswer("answer-body");
-		const lines = ctl.render(80);
-		// banner + blank + 0 history + echo + blank + 1 answer + blank + footer = 7
-		expect(lines.length).toBe(7);
+describe("BtwPopupController viewport", () => {
+	it("shows older transcript content after PageUp and returns to newest on PageDown", () => {
+		const history = Array.from({ length: 12 }, (_, i) => makeTurn(`marker-${i}`, `answer-${i}`));
+		const { ctl } = makeController({ history, rows: 12 });
+		const newest = ctl.render(100).join("\n");
+		expect(newest).toContain("answer-11");
+		expect(newest).not.toContain("marker-0");
+		let older = newest;
+		for (let i = 0; i < 30 && !older.includes("marker-0"); i++) {
+			ctl.handleInput("\u001b[5~");
+			older = ctl.render(100).join("\n");
+		}
+		expect(older).toContain("marker-0");
+		for (let i = 0; i < 30; i++) ctl.handleInput("\u001b[6~");
+		expect(ctl.render(100).join("\n")).toContain("answer-11");
 	});
 
-	it("clips top when content overflows terminal height; scroll↑ reveals older history", () => {
-		// Use distinct non-overlapping markers so substring matches are unambiguous.
-		const history: BtwTurn[] = Array.from({ length: 20 }, (_, i) => makeTurn(`mark-${i + 1}-end`));
-		const { ctl } = makeController({ history, rows: 10 });
-		ctl.setAnswer("A");
-		const base = ctl.render(80);
-		const maxRows = Math.floor(10 * 0.85); // 8
-		expect(base.length).toBe(maxRows);
-		// Bottom-anchored: footer + answer visible; earliest history hidden
-		expect(base.join("\n")).not.toContain("mark-1-end");
-		expect(base.join("\n")).toContain("mark-20-end");
-		expect(base.join("\n")).toContain("Esc to dismiss");
-		// Scroll up reveals older history at the top.
+	it("forwards arrow keys to Input instead of scrolling", () => {
+		const input = vi.spyOn(Input.prototype, "handleInput");
+		const { ctl } = makeController({ history: [makeTurn("old")] });
 		ctl.handleInput("\u001b[A");
-		const scrolled = ctl.render(80);
-		expect(scrolled.length).toBe(maxRows);
+		expect(input).toHaveBeenCalledWith("\u001b[A");
 	});
 
-	it("scroll↓ at bottom stays clamped (no throw, still renders maxRows)", () => {
-		const history: BtwTurn[] = Array.from({ length: 20 }, (_, i) => makeTurn(`mark-${i + 1}-end`));
-		const { ctl } = makeController({ history, rows: 10 });
-		ctl.setAnswer("A");
-		ctl.handleInput("\u001b[B"); // down
-		const out = ctl.render(80);
-		const maxRows = Math.floor(10 * 0.85);
-		expect(out.length).toBe(maxRows);
-	});
-
-	it("invalidate() is a callable no-op", () => {
-		const { ctl } = makeController();
-		expect(() => ctl.invalidate()).not.toThrow();
+	it("invalidates the input and rendered markdown components", () => {
+		const { ctl } = makeController({ history: [makeTurn("q", "**answer**")] });
+		const input = vi.spyOn(Input.prototype, "invalidate");
+		ctl.render(80);
+		ctl.invalidate();
+		expect(input).toHaveBeenCalled();
 	});
 });
 
-describe("BtwOverlayController — banner + echo formatting", () => {
-	it("banner is padded to full visible width", () => {
-		const { ctl } = makeController({ question: "q" });
-		const banner = ctl.render(40)[0];
-		expect(visibleWidth(banner)).toBe(40);
-	});
-
-	it("truncates long questions in the banner with ellipsis", () => {
-		const long = "a".repeat(200);
-		const { ctl } = makeController({ question: long });
-		const banner = ctl.render(40)[0];
-		expect(visibleWidth(banner)).toBe(40);
-		expect(banner).toContain("…");
-	});
-
-	it("history echo uses '/btw ' prefix and trims whitespace", () => {
-		const { ctl } = makeController({ history: [makeTurn("  multi\nline   q  ")] });
-		const out = ctl.render(80).join("\n");
-		expect(out).toContain("/btw multi line q");
-	});
-});
-
-describe("showBtwOverlay — factory wiring", () => {
-	it("invokes ctx.ui.custom with overlay options and resolves controllerReady with the BtwOverlayController", async () => {
-		const requestRender = vi.fn();
-		const tui = { requestRender, terminal: { rows: 24 } } as unknown as TUI;
-		const custom = vi.fn((factory: unknown, opts: unknown) => {
-			const f = factory as (
-				tui: TUI,
-				theme: Theme,
-				kb: undefined,
-				done: (v: undefined) => void,
-			) => BtwOverlayController;
-			const ctl = f(tui, identityTheme, undefined, () => {});
-			// Keep `opts` addressable for the assertion below.
-			(custom as unknown as { lastOpts: unknown }).lastOpts = opts;
-			return new Promise<void>(() => {
-				// keep pending so we can inspect the controller
-				void ctl;
-			});
-		});
-		const ctx = { ui: { custom } } as never;
-
-		const { controllerReady } = showBtwOverlay({
-			ctx,
-			question: "q",
-			history: [],
-			controller: new AbortController(),
-			onClearHistory: vi.fn(),
-		});
-
-		const ctl = await controllerReady;
-		expect(ctl).toBeInstanceOf(BtwOverlayController);
-		expect(custom).toHaveBeenCalledTimes(1);
-		const opts = (custom as unknown as { lastOpts: { overlay: boolean; overlayOptions: unknown } }).lastOpts;
-		expect(opts).toMatchObject({ overlay: true });
-		expect(opts.overlayOptions).toMatchObject({ anchor: "bottom-center" });
-	});
-
-	it("controller returned by the factory is the same one exposed via controllerReady", async () => {
-		let factoryCtl: BtwOverlayController | undefined;
-		const custom = vi.fn((factory: unknown) => {
-			const f = factory as (
-				tui: TUI,
-				theme: Theme,
-				kb: undefined,
-				done: (v: undefined) => void,
-			) => BtwOverlayController;
-			factoryCtl = f(
-				{ requestRender: vi.fn(), terminal: { rows: 24 } } as unknown as TUI,
-				identityTheme,
-				undefined,
-				() => {},
-			);
+describe("showBtwPopup", () => {
+	it("uses a centered responsive overlay and starts an initial question", async () => {
+		let component!: BtwPopupController;
+		const custom = vi.fn((factory: any, opts: any) => {
+			component = factory(makeTui(), identityTheme, {}, () => {});
+			(custom as any).options = opts;
 			return new Promise<void>(() => {});
 		});
+		const onSubmit = vi.fn(async () => ({ kind: "success", answer: "ok" }) as BtwPopupSubmitResult);
 		const ctx = { ui: { custom } } as never;
-		const { controllerReady } = showBtwOverlay({
+		showBtwPopup({
 			ctx,
-			question: "q",
 			history: [],
-			controller: new AbortController(),
+			initialQuestion: "initial question",
+			modelLabel: "model",
+			onSubmit,
 			onClearHistory: vi.fn(),
 		});
-		const ctl = await controllerReady;
-		expect(ctl).toBe(factoryCtl);
+		await vi.waitFor(() => expect(onSubmit).toHaveBeenCalledWith("initial question", expect.any(AbortController)));
+		expect(component).toBeInstanceOf(BtwPopupController);
+		expect((custom as any).options).toMatchObject({
+			overlay: true,
+			overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%", margin: 1 },
+		});
 	});
 });

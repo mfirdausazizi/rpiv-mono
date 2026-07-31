@@ -1,102 +1,86 @@
 # What `/btw` sends to the model
 
-Exactly what every `/btw` call puts in front of its effective model, where each
-piece comes from, and what is guaranteed never to leave the panel.
+Each submitted question is one non-streaming completion. `/btw` opens a
+centered popup, but the popup does not own model or history state.
 
 ## The request
 
-Each `/btw` call is a single non-streaming completion. By default, the effective
-model and reasoning level are `ctx.model` and `pi.getThinkingLevel()`. A global
-override selected through `/btw-settings` is resolved on every call through
-`ctx.modelRegistry.find(provider, modelId)` and supplies its persisted reasoning
-level. If that model is unavailable, the call fails explicitly rather than silently
-falling back to the session model.
+The effective model and reasoning level are `ctx.model` and
+`pi.getThinkingLevel()` by default. `/btw-settings` can override both. A
+configured model is resolved explicitly through `ctx.modelRegistry.find`; if it
+is unavailable, `/btw` fails instead of silently substituting the session model.
+The picker uses scoped models when the host exposes a non-empty scope, and falls
+back to all available models on empty or older-host scopes.
 
-Custom extension providers dispatch through Pi's auth-aware `ModelRuntime`
-facade, which resolves credentials and provider-specific endpoint data. Older Pi
-hosts retain the legacy global `completeSimple()` fallback.
+Custom providers use Pi's auth-aware `ModelRuntime.completeSimple()` when
+available. Older hosts retain the legacy `completeSimple()` fallback.
 
 | Part | Value |
 | --- | --- |
-| Model | Session model/reasoning, or the global `/btw-settings` override |
-| System prompt | the bundled `prompts/btw-system.txt`, plus the cross-session hint appendix |
-| Messages | `[...branch clone, ...this-session /btw turns, your question]` |
-| Tools | `[]` — none, always |
-| Abort signal | a fresh `AbortController` owned by `/btw`, never `ctx.signal` |
+| Model | Session model or the validated `/btw-settings` override |
+| System prompt | Bundled `prompts/btw-system.txt` plus the cross-session hint |
+| Messages | `[...branch clone, ...successful BTW turns, your question]` |
+| Tools | `[]` — always none |
+| Abort signal | A fresh popup-owned `AbortController` per submission |
 
 ## The branch clone
 
-The first block of messages is a read-only clone of your current session branch,
-so you do not have to re-explain what you have been working on.
+The first messages are a read-only clone of the current session branch. The
+`message_end` hook snapshots `ctx.sessionManager.getBranch()` after completed
+assistant messages whose `stopReason` is not `toolUse`.
 
-- The `message_end` hook takes the snapshot: it reads `ctx.sessionManager.getBranch()`
-  and converts it with `convertToLlm`.
-- It snapshots **only** on `role === "assistant"` messages, and **only** when
-  `stopReason !== "toolUse"` — so mid-tool-call states never become the context.
-- Snapshots are cached per session, keyed by `ctx.sessionManager.getSessionFile()`,
-  falling back to `memory:<sessionId>` when there is no session file.
-- Cold start: if no `message_end` has fired yet, `/btw` reads the branch live
-  instead of using a cache.
+Snapshots are cached per session-file key, with `memory:<sessionId>` as the
+fallback. A cold `/btw` reads the branch live. Cached snapshots are invalidated on
+`session_compact` and `session_tree`; `/btw` never invokes or mutates main-session
+compaction.
 
-### Invalidation
+## Context fitting and provider-cap recovery
 
-The cached snapshot is deleted on both `session_compact` and `session_tree`, so a
-`/btw` issued after compaction or a branch switch never answers off a stale view
-of the conversation.
+The budget engine preserves compacted branch summaries and fits the branch plus
+BTW history without changing the main session. If the provider returns an error
+such as:
 
-Auto-compaction races session disposal in pi-core: `session_compact` can fire
-with an already-invalidated `ctx` proxy. `/btw` swallows only that specific stale
-error (`stale after session replacement`) — the session being compacted has no
-snapshot worth invalidating. Every other error propagates, because it is a bug.
+- `maximum prompt length is 500000`
+- `maximum prompt length is 500,000`
 
-## The `/btw` history
+`/btw` parses the numeric cap, applies a 10% safety margin, creates a temporary
+model copy whose context window targets that prompt limit, rebuilds from the
+unchanged snapshot/history, and retries exactly once. When no numeric cap is
+available but the host recognizes context overflow, the existing conservative
+half-budget fallback is used. A second overflow is returned as an error; there
+is no third call. A successful response is never retried merely because it has
+an `errorMessage` field.
 
-After a successful answer, the turn is appended to this session's `/btw` history,
-and every later `/btw` call in the same session replays that history between the
-branch clone and your new question. Follow-ups therefore work: the side thread
-has its own memory.
+## BTW history
 
-History stores the **actual** `UserMessage` and `AssistantMessage` object
-references returned by the call — nothing is reconstructed or re-serialised.
-Concatenated in a fixed order, this keeps the prompt prefix byte-identical
-across calls, so provider-side prompt caching keeps hitting.
+Only successful results append history. The command layer stores the actual
+`UserMessage` and `AssistantMessage` objects returned by the completion exactly
+once. Each later follow-up replays those turns between the branch clone and the
+new question. This history is process-scoped and non-persistent.
 
-Press `x` in the overlay to clear this session's history. It is also dropped when
-the Pi process exits.
+Inside the popup:
 
-## The cross-session hint
+- Enter submits a question and clears only the submitted input.
+- Enter during a pending request is ignored.
+- PageUp/PageDown scroll transcript rows from the bottom and clamp at both ends.
+- Ctrl+L clears the local transcript and this session's process history.
+- Escape aborts the active request and closes; late provider results are ignored.
 
-The system prompt gets an appendix listing the last **10** `/btw` *question
-strings* from **all** sessions in the current Pi process, oldest first, under the
-heading `## Recent /btw questions across sessions (oldest first)`. Each is
-whitespace-collapsed and truncated to 200 characters.
+Successful assistant text is rendered with native Markdown and the current
+Pi Markdown theme. Pending, error, and context-trimmed states remain visible in
+the transcript. Ordinary arrows and editing keys are delegated to native Input.
 
-- Only your question text crosses sessions — never answers, never branch content.
-- The system prompt tells the model to treat it as a pattern hint, useful only
-  when the side question is itself about recent topics or trends.
-- Clearing a session's history with `x` removes its contributions to the hint.
-- It lives on the same process-scoped state, so it is gone when Pi exits.
+## Cross-session hint
 
-## The system prompt
-
-`prompts/btw-system.txt` tells the side call to:
-
-- treat the primary conversation as background, not as work to continue — the
-  side question is self-contained, and it must not pick up a tool call mid-flight;
-- answer directly and concisely, in compact bullets or short paragraphs;
-- cite files, functions, and line numbers when grounding a claim in the context;
-- say so briefly when the context is insufficient, rather than guessing;
-- use no tools and reply in plain text only, even if prior assistant turns in the
-  context demonstrate tool use.
+The system prompt appends the last 10 question strings from all process-scoped
+BTW histories, oldest first. Questions are whitespace-collapsed and truncated to
+200 characters. Answers and branch content never cross sessions. Clearing one
+session removes its questions from this hint.
 
 ## What never happens
 
-- **No transcript entry.** The answer is rendered through `ctx.ui.custom` as an
-  overlay component. It is never emitted as an agent message.
-- **No answer/history disk writes.** History and snapshots live on
-  `globalThis[Symbol.for("rpiv-btw")]`. Only `/btw-settings` writes its global
-  model configuration; side questions and answers remain memory-only.
-- **No tool use.** The call runs with `tools: []`, so a side question cannot edit
-  a file or run a command even if it wanted to.
-- **No effect on the main session.** `Esc` aborts the `/btw` controller only; the
-  main agent's signal is never touched.
+- No answer enters the main transcript.
+- No side answer or history is written to disk.
+- No tools are available to the side call.
+- No main-session signal is aborted by Escape.
+- No `/btw` command triggers compaction.

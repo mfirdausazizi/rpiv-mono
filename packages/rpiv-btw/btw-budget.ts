@@ -19,12 +19,11 @@ import {
 	type SessionEntry,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import type { BtwTurn } from "./btw.js";
+import type { BtwTurn } from "./btw-messages.js";
 
 // ---------------------------------------------------------------------------
-// Budget constants — the engine's tuning surface. Defined in this leaf module so
-// the btw.ts ↔ btw-budget.ts dependency is type-only at runtime (btw.ts re-exports
-// them for the package's public surface).
+// Budget constants — the engine's tuning surface. Defined in this leaf module and
+// re-exported by btw.ts for the package's public surface.
 // ---------------------------------------------------------------------------
 export const BTW_HISTORY_TOKEN_BUDGET = 8192; // cap /btw history (newest-suffix of BtwTurn[])
 export const BTW_CONTEXT_RESERVE = 16384; // matches host DEFAULT_COMPACTION_SETTINGS.reserveTokens

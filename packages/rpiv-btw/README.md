@@ -3,16 +3,9 @@
 [![npm version](https://img.shields.io/npm/v/@juicesharp/rpiv-btw.svg)](https://www.npmjs.com/package/@juicesharp/rpiv-btw)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-<div align="center">
-  <a href="https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-btw">
-    <img src="https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-btw/docs/cover.png" alt="rpiv-btw cover art: a Pi transcript with a /btw side question answered below it, labelled ephemeral and never written" width="50%">
-  </a>
-</div>
-
-Ask a side question without polluting the main conversation. `rpiv-btw` adds
-`/btw <question>` to [Pi Agent](https://github.com/badlogic/pi-mono) — the session
-model, or a globally configured alternative, answers in a panel using a read-only
-clone of the current conversation as context. The answer never enters the transcript.
+Ask side questions without polluting the main conversation. `rpiv-btw` adds
+`/btw` to [Pi Agent](https://github.com/badlogic/pi-mono); answers use a
+read-only clone of the current conversation and never enter the transcript.
 
 ## Install
 
@@ -20,85 +13,70 @@ clone of the current conversation as context. The answer never enters the transc
 pi install npm:@juicesharp/rpiv-btw
 ```
 
-Restart your Pi session.
+Restart Pi after installing.
 
 ## Quick start
 
-Type `/btw` followed by your question:
+- `/btw` opens an empty, focused centered popup.
+- `/btw why did we switch from sockets to SSE?` opens the same popup and submits immediately.
+- Press Enter for follow-ups. Successful turns remain in the popup and are replayed to the next side call.
 
-```
-/btw why did we switch from sockets to SSE last week?
-```
-
-A panel opens at the bottom of the terminal with your question on a banner, a `…`
-while the model works, and the answer when it arrives. Prior `/btw` questions from
-this session are listed under the banner, so follow-ups have context.
-
-By default, `/btw` follows the model and reasoning level driving the current session.
-Run `/btw-settings` to choose a global model and reasoning level instead, or reset
-back to “Follow current session.” Settings are stored in
-`~/.config/rpiv-btw/config.json` (or `$XDG_CONFIG_HOME/rpiv-btw/config.json`).
-
-![The /btw panel at the bottom of a Pi Agent terminal, showing the echoed question, a multi-paragraph answer, and the key-hint footer](https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-btw/docs/overlay.jpg)
+Answers render as Markdown. Controls:
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Scroll the panel whenever content overflows — the hint appears once the answer arrives |
-| `x` | Clear this session's `/btw` history — hint shown only when you have prior entries |
-| `Esc` | Dismiss the panel, cancelling the call if it is still running |
+| `Enter` | Submit the current question |
+| `PageUp` / `PageDown` | Scroll the transcript by one viewport |
+| `Ctrl+L` | Clear the popup and this process's `/btw` history |
+| `Esc` | Abort the active side request and close |
+
+The popup is centered and responsive. Its input owns ordinary editing, arrows,
+paste, and IME behavior. Side calls are non-streaming and one request at a time.
+
+By default, `/btw` follows the current session model and reasoning level. Run
+`/btw-settings` to choose a global model and reasoning override, or reset to
+“Follow current session.” The picker searches model name, provider, and model ID,
+and uses the current host's scoped models when available. An empty scope and older
+hosts fall back to all available models.
+
+Settings are stored at `~/.config/rpiv-btw/config.json` (or
+`$XDG_CONFIG_HOME/rpiv-btw/config.json`). Popup history is process-scoped and is
+not written to disk.
 
 ## What you get
 
-- **Nothing leaks into the main chat** — the answer is drawn in an overlay, never
-  emitted as an agent message or written to the transcript. Only global model settings are persisted.
-- **The side question already knows your work** — it is handed a read-only clone
-  of the current conversation branch, so you do not re-explain context.
-- **Follow-ups have their own thread** — every `/btw` turn in a session is replayed
-  into the next one, so the side conversation remembers itself.
-- **`Esc` cancels only the side question** — cancelling it never interrupts what
-  the main session is doing.
-- **Survives `/new`, `/fork`, `/resume`, `/reload`** — history is held in the
-  running Pi process and clears when Pi exits.
-- **Correct after compaction** — the context snapshot is rebuilt whenever the
-  conversation is compacted or re-branched, so a later `/btw` never answers off a
-  stale view.
-- **No tools, plain text** — a side question cannot edit a file or run a command.
+- **No main-chat pollution** — the popup never emits an agent message.
+- **Branch context** — the side request sees a read-only branch snapshot.
+- **Follow-up context** — only successful turns are added to process-scoped BTW history, exactly once.
+- **Safe cancellation** — Escape aborts only the active BTW request.
+- **Compaction-safe context** — branch snapshots are invalidated after compaction or tree changes, but `/btw` never triggers or mutates main-session compaction.
+- **Provider-cap recovery** — a numeric provider prompt limit is parsed, a 10%-safe temporary context window is rebuilt, and exactly one retry is attempted. Unrecognized host-reported overflow retains the conservative half-budget fallback.
+- **No tools** — side calls always use `tools: []`.
 
 ## Reference
 
-- [Context model](https://github.com/juicesharp/rpiv-mono/blob/main/packages/rpiv-btw/docs/context-model.md) — exactly what each `/btw` call
-  sends to the model: the branch snapshot and its invalidation rules, session
-  history threading, the cross-session question hint, and the no-pollution
-  guarantees.
-- [Architecture](https://github.com/juicesharp/rpiv-mono/blob/main/packages/rpiv-btw/docs/architecture.md) — modules, registered command and
-  hooks, overlay layout and key handling, process-scoped state, Pi host-version
-  tolerance, and the full error-message list.
+- [Context model](docs/context-model.md) — request contents, budgeting, history, and invalidation.
+- [Architecture](docs/architecture.md) — popup ownership, command flow, lifecycle hooks, and compatibility.
 
 ## Requirements
 
-- **An interactive terminal.** `/btw` refuses to run without a UI — it is not
-  available under `pi --print` or RPC.
-- **A resolvable model with working credentials.** This can be the active session model or the model selected with `/btw-settings`; any registered provider works.
+- An interactive Pi terminal; RPC and `pi --print` do not have a popup UI.
+- A resolvable model with working credentials, either from the active session or `/btw-settings`.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `/btw requires interactive mode` | Running under `pi --print …` or RPC | Run Pi interactively |
-| `/btw requires an active model` | Follow-session mode has no primary model configured | Set one with `/login`, or choose one with `/btw-settings` |
-| `Configured /btw model … is no longer available` | The persisted provider/model is no longer registered | Run `/btw-settings` and choose another model or “Follow current session” |
-| `/btw model (…) has no API key available.` | Credentials for the effective model do not resolve | Re-authenticate that provider |
-| `Usage: /btw <question>` | `/btw` ran with no argument | Put the question on the same line |
-| Pressing `X` does nothing | Only lowercase `x` is bound to clear history | Press `x` |
-| History gone after restarting Pi | By design — state is process-scoped, never written to disk | Nothing to fix; your main session is unaffected |
+| `/btw requires interactive mode` | Running without a UI | Run Pi interactively |
+| `/btw requires an active model` | Follow-session mode has no model | Configure `/login` or `/btw-settings` |
+| `Configured /btw model … is no longer available` | Persisted model is not registered | Run `/btw-settings` |
+| `/btw model (…) has no API key available.` | Credentials do not resolve | Re-authenticate that provider |
+| History disappears after restarting Pi | History is intentionally process-scoped | Nothing to fix; the main session is unaffected |
 
 ## Related
 
-- [`@juicesharp/rpiv-pi`](https://www.npmjs.com/package/@juicesharp/rpiv-pi) — the
-  umbrella package. It does not install `rpiv-btw`; install this one yourself when
-  you want `/btw`.
-- [juicesharp/rpiv-mono](https://github.com/juicesharp/rpiv-mono#readme) — the rest
-  of the rpiv family.
+- [`@juicesharp/rpiv-pi`](https://www.npmjs.com/package/@juicesharp/rpiv-pi) — umbrella package.
+- [juicesharp/rpiv-mono](https://github.com/juicesharp/rpiv-mono#readme) — the rpiv family.
 
 ## License
 
