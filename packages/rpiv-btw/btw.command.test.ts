@@ -23,9 +23,14 @@ vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
 	};
 });
 
+vi.mock("./config.js", () => ({
+	loadBtwConfig: vi.fn(() => ({})),
+}));
+
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { BTW_COMMAND_NAME, BTW_STATE_KEY, registerBtwCommand } from "./btw.js";
 import { showBtwOverlay } from "./btw-ui.js";
+import { loadBtwConfig } from "./config.js";
 
 const model = { provider: "a", id: "m" } as unknown as Model<Api>;
 
@@ -56,6 +61,7 @@ function doneResponse(text: string) {
 beforeEach(() => {
 	vi.mocked(showBtwOverlay).mockReset();
 	vi.mocked(completeSimple).mockReset();
+	vi.mocked(loadBtwConfig).mockReset().mockReturnValue({});
 });
 
 afterEach(() => {
@@ -108,6 +114,47 @@ describe("/btw — happy path", () => {
 		expect(ctl.setAnswer).toHaveBeenCalledWith("42");
 		expect(ctl.setError).not.toHaveBeenCalled();
 		expect(ctl.setTrimmed).not.toHaveBeenCalled();
+		expect(completeSimple).toHaveBeenCalledWith(
+			model,
+			expect.anything(),
+			expect.objectContaining({ reasoning: "medium" }),
+		);
+	});
+});
+
+describe("configured model", () => {
+	const configured = {
+		provider: "cliproxyapi",
+		id: "gpt-5.6-sol",
+		name: "GPT 5.6 Sol",
+		reasoning: true,
+	} as unknown as Model<Api>;
+
+	it("uses the persisted model and reasoning level", async () => {
+		vi.mocked(loadBtwConfig).mockReturnValue({
+			modelKey: "cliproxyapi/gpt-5.6-sol",
+			effort: "high",
+		});
+		stubOverlay();
+		vi.mocked(completeSimple).mockResolvedValueOnce(doneResponse("configured") as never);
+		const cmd = register();
+		const ctx = createMockCtx({ hasUI: true, model, models: [configured] });
+		await cmd.handler("question", ctx as never);
+		expect(completeSimple).toHaveBeenCalledWith(
+			configured,
+			expect.anything(),
+			expect.objectContaining({ reasoning: "high" }),
+		);
+	});
+
+	it("reports an unavailable configured model before opening the overlay", async () => {
+		vi.mocked(loadBtwConfig).mockReturnValue({ modelKey: "missing/model", effort: "medium" });
+		const cmd = register();
+		const ctx = createMockCtx({ hasUI: true, model, models: [configured] });
+		await cmd.handler("question", ctx as never);
+		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("no longer available"), "error");
+		expect(showBtwOverlay).not.toHaveBeenCalled();
+		expect(completeSimple).not.toHaveBeenCalled();
 	});
 });
 

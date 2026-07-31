@@ -7,6 +7,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `/btw-settings` persists a global model and reasoning-level override, with a “Follow current session” option that uses the active session model and reasoning level. Configured extension providers continue through Pi's auth-aware model runtime, and unavailable configured models fail explicitly instead of silently falling back.
+
 ## [2.2.0] - 2026-07-29
 
 ### Added

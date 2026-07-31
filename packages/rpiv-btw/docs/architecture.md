@@ -7,10 +7,12 @@ how state is stored, and how the package tolerates different Pi host versions.
 
 ```
 rpiv-btw/
-├── index.ts             — extension entry; registers the command + 3 hooks
-├── btw.ts               — state, snapshotting, message threading, the model call
+├── index.ts             — extension entry; registers commands + lifecycle hooks
+├── btw.ts               — state, snapshotting, message threading, effective-model call
+├── btw-settings.ts      — global model/reasoning picker
+├── config.ts            — validated XDG-aware settings persistence
 ├── btw-ui.ts            — bottom-anchored overlay component and key handling
-├── pi-compat.ts         — host-version-tolerant loader for pi-ai's completeSimple
+├── pi-compat.ts         — host-version-tolerant completion/runtime bridge
 └── prompts/
     └── btw-system.txt   — system prompt for the side call
 ```
@@ -27,11 +29,12 @@ asserts that the published `files` list covers every production module.
 
 ## What gets registered
 
-One slash command:
+Two slash commands:
 
 | Command | Description string |
 | --- | --- |
 | `/btw <question>` | `Ask a side question without polluting the main conversation` |
+| `/btw-settings` | `Configure the global model and reasoning level used by /btw` |
 
 Three lifecycle hooks:
 
@@ -58,8 +61,8 @@ key when there is no session file.
 Using `globalThis` plus `Symbol.for()` (the same idiom OpenTelemetry uses for
 cross-import-graph singletons) means the cell survives module re-import, so
 `/btw` history outlives `/new`, `/fork`, `/resume`, and `/reload`. It is lost
-when the Pi process exits — by design. Nothing is persisted to disk, and the
-package reads no environment variables and no config files.
+when the Pi process exits. Separately, `/btw-settings` persists only its model
+and reasoning override under the XDG-aware `rpiv-btw/config.json` path.
 
 ## Overlay
 
@@ -140,7 +143,8 @@ Every user-visible string the package can produce:
 | --- | --- |
 | `/btw requires interactive mode` (error) | `ctx.hasUI` is false — `pi --print`, RPC |
 | `Usage: /btw <question>` (warning) | the argument is empty or whitespace-only |
-| `/btw requires an active model` (error) | there is no `ctx.model` |
+| `/btw requires an active model` (error) | follow-session mode has no `ctx.model` |
+| `Configured /btw model <key> is no longer available; run /btw-settings` | persisted model lookup failed |
 | `/btw model (<provider>:<id>) is misconfigured: <err>` | credential lookup returned an error |
 | `/btw model (<provider>:<id>) has no API key available.` | lookup succeeded but the API key is empty |
 | `/btw call failed: <err ?? "unknown error">` | the completion returned `stopReason: "error"` |
@@ -152,10 +156,9 @@ rest render inside the overlay in the error style.
 
 ## Boundaries
 
-- **No runtime dependencies.** No `dependencies`, no `devDependencies` — only the
-  three `@earendil-works` peers.
-- **No sibling imports at runtime.** `pi-compat.ts` deliberately duplicates
-  rpiv-core's `isModuleNotFound` rather than importing it, because the rpiv
-  packages never import each other at runtime.
+- **One runtime dependency.** `@juicesharp/rpiv-config` owns secure XDG-aware JSON
+  persistence and the model-key codec; the three Pi packages remain peer dependencies.
+- **No duplicated config layer.** Model-key parsing and file permissions reuse the
+  existing sibling utility instead of adding package-local filesystem code.
 - **Standalone.** rpiv-btw is excluded from `rpiv-pi`'s auto-install sibling list,
   and a test asserts that exclusion.

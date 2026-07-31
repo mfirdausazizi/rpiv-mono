@@ -1,7 +1,7 @@
 {
   "name": "@juicesharp/rpiv-btw",
   "version": "2.2.0",
-  "description": "Pi extension. The /btw slash command, for putting a one-off side question to the same primary model without polluting the main conversation.",
+  "description": "Pi extension. Ask side questions with the session model or a global model override without polluting the main conversation.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -33,7 +33,9 @@
     "btw.ts",
     "btw-budget.ts",
     "btw-messages.ts",
+    "btw-settings.ts",
     "btw-ui.ts",
+    "config.ts",
     "pi-compat.ts",
     "prompts/",
     "docs/",
@@ -47,6 +49,9 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "@juicesharp/rpiv-config": "^2.2.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

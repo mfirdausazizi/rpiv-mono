@@ -9,7 +9,15 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { AssistantMessage, Message, StopReason, UserMessage } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	Message,
+	Model,
+	StopReason,
+	ThinkingLevel,
+	UserMessage,
+} from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	type ExtensionAPI,
@@ -17,9 +25,11 @@ import {
 	type ExtensionContext,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { parseModelKey } from "@juicesharp/rpiv-config";
 import { type CappedHistory, capHistory, type FitBranchResult, fitBranch } from "./btw-budget.js";
 import { assistantMessageText, type BtwTurn, userMessageText } from "./btw-messages.js";
 import { showBtwOverlay } from "./btw-ui.js";
+import { type BtwEffort, loadBtwConfig } from "./config.js";
 import { getRuntimeCompleteSimple, loadCompleteSimple, loadIsContextOverflow } from "./pi-compat.js";
 
 // ---------------------------------------------------------------------------
@@ -40,6 +50,8 @@ export const CROSS_SESSION_HINT_LIMIT = 10;
 const MSG_REQUIRES_INTERACTIVE = "/btw requires interactive mode";
 const MSG_USAGE = "Usage: /btw <question>";
 const MSG_NO_MODEL = "/btw requires an active model";
+const errConfiguredModelUnavailable = (key: string) =>
+	`Configured /btw model ${key} is no longer available; run /btw-settings`;
 
 // Errors (static)
 const ERR_EMPTY_RESPONSE = "/btw returned no text content.";
@@ -172,6 +184,27 @@ export type BtwExecResult =
 	| { kind: "error"; error: string; stopReason?: StopReason }
 	| { kind: "aborted"; stopReason: StopReason };
 
+export interface BtwExecutionOptions {
+	model?: Model<Api>;
+	reasoning?: BtwEffort;
+}
+
+function resolveBtwExecution(pi: ExtensionAPI, ctx: ExtensionCommandContext): BtwExecutionOptions | { error: string } {
+	const config = loadBtwConfig();
+	if (!config.modelKey) {
+		if (!ctx.model) return { error: MSG_NO_MODEL };
+		const sessionReasoning = pi.getThinkingLevel();
+		return {
+			model: ctx.model,
+			reasoning: sessionReasoning === "off" ? undefined : (sessionReasoning as BtwEffort),
+		};
+	}
+	const parsed = parseModelKey(config.modelKey);
+	const model = parsed ? ctx.modelRegistry.find(parsed.provider, parsed.modelId) : undefined;
+	if (!model) return { error: errConfiguredModelUnavailable(config.modelKey) };
+	return { model, reasoning: model.reasoning ? config.effort : undefined };
+}
+
 function readBranchSnapshot(ctx: ExtensionContext): { messages: Message[]; entries: SessionEntry[] } {
 	const cached = getSnapshot(ctx);
 	if (cached) return cached;
@@ -193,9 +226,8 @@ export function buildBtwMessages(
 	ctx: ExtensionContext,
 	userMessage: UserMessage,
 	keepBudget?: number,
+	model: Model<Api> = ctx.model!,
 ): BtwBuiltContext {
-	// ctx.model is non-null here — executeBtw returns early on !model before calling.
-	const model = ctx.model!;
 	const history = getSessionHistory(ctx);
 	const { messages, entries } = readBranchSnapshot(ctx);
 	const systemPrompt = buildSystemPrompt();
@@ -248,11 +280,13 @@ export async function executeBtw(
 	question: string,
 	ctx: ExtensionContext,
 	controller: AbortController,
+	options: BtwExecutionOptions = {},
 ): Promise<BtwExecResult> {
-	const model = ctx.model;
+	const model = options.model ?? ctx.model;
 	if (!model) {
 		return { kind: "error", error: MSG_NO_MODEL };
 	}
+	const reasoning = options.reasoning;
 	const modelLabel = `${model.provider}:${model.id}`;
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -271,7 +305,7 @@ export async function executeBtw(
 	// `let` because the overflow retry reassigns `built` with a halved budget;
 	// buildBtwMessages returns BtwBuiltContext { messages, systemPrompt,
 	// droppedTurns, branchWasTrimmed, stubbed, keepBudget }.
-	let built = buildBtwMessages(ctx, userMessage);
+	let built = buildBtwMessages(ctx, userMessage, undefined, model);
 
 	try {
 		const runtimeCompleteSimple = getRuntimeCompleteSimple(ctx.modelRegistry);
@@ -281,16 +315,18 @@ export async function executeBtw(
 		const callCompleteSimple = async (
 			built: BtwBuiltContext,
 		): Promise<{ kind: "aborted"; stopReason: StopReason } | { kind: "completed"; response: AssistantMessage }> => {
+			const requestReasoning = reasoning as ThinkingLevel | undefined;
 			const response = await completeSimple(
 				model,
 				{ systemPrompt: built.systemPrompt, messages: built.messages, tools: [] },
 				// Runtime auth must resolve its own key/headers/baseUrl; explicit overrides bypass it.
 				runtimeCompleteSimple
-					? { signal: controller.signal }
+					? { signal: controller.signal, ...(requestReasoning ? { reasoning: requestReasoning } : {}) }
 					: {
 							apiKey: auth.apiKey,
 							headers: auth.headers,
 							signal: controller.signal, // own AbortController, NOT ctx.signal (Decision 8)
+							...(requestReasoning ? { reasoning: requestReasoning } : {}),
 						},
 			);
 			if (response.stopReason === "aborted") {
@@ -310,7 +346,7 @@ export async function executeBtw(
 		// stopReason-based willRetry.
 		if (overflowFn && !retried && overflowFn(response, model.contextWindow)) {
 			retried = true;
-			built = buildBtwMessages(ctx, userMessage, Math.floor(built.keepBudget / 2));
+			built = buildBtwMessages(ctx, userMessage, Math.floor(built.keepBudget / 2), model);
 			outcome = await callCompleteSimple(built);
 			if (outcome.kind === "aborted") return outcome;
 			response = outcome.response;
@@ -390,7 +426,7 @@ export function registerBtwCommand(pi: ExtensionAPI): void {
 	});
 }
 
-async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
+async function handleBtwCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify(MSG_REQUIRES_INTERACTIVE, "error");
 		return;
@@ -400,8 +436,9 @@ async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionC
 		ctx.ui.notify(MSG_USAGE, "warning");
 		return;
 	}
-	if (!ctx.model) {
-		ctx.ui.notify(MSG_NO_MODEL, "error");
+	const execution = resolveBtwExecution(pi, ctx);
+	if ("error" in execution) {
+		ctx.ui.notify(execution.error, "error");
 		return;
 	}
 
@@ -417,7 +454,7 @@ async function handleBtwCommand(_pi: ExtensionAPI, args: string, ctx: ExtensionC
 	});
 
 	const overlayCtl = await controllerReady;
-	const result = await executeBtw(question, ctx, controller);
+	const result = await executeBtw(question, ctx, controller, execution);
 
 	switch (result.kind) {
 		case "success": {

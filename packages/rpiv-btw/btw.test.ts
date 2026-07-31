@@ -181,20 +181,44 @@ describe("executeBtw — ok path", () => {
 		expect(r.assistantMessage).toBeDefined();
 	});
 
-	it("uses Pi's auth-aware runtime for custom providers", async () => {
+	it("uses Pi's auth-aware runtime for a selected custom provider and reasoning level", async () => {
 		const ctx = createMockCtx();
-		ctx.model = { provider: "custom", id: "m", api: "custom-responses" } as never;
+		ctx.model = { provider: "session", id: "model", contextWindow: 200000 } as never;
+		const selected = {
+			provider: "custom",
+			id: "m",
+			api: "custom-responses",
+			contextWindow: 100000,
+		} as never;
 		const runtimeCompleteSimple = vi.fn(async () => makeCompletionResponse({ text: "custom answer" }));
 		vi.mocked(getRuntimeCompleteSimple).mockReturnValue(runtimeCompleteSimple as never);
 		const controller = new AbortController();
 
-		const result = await executeBtw("question", ctx, controller);
+		const result = await executeBtw("question", ctx, controller, { model: selected, reasoning: "high" });
 
 		expect(result).toMatchObject({ kind: "success", answer: "custom answer" });
-		expect(runtimeCompleteSimple).toHaveBeenCalledWith(ctx.model, expect.objectContaining({ tools: [] }), {
+		expect(runtimeCompleteSimple).toHaveBeenCalledWith(selected, expect.objectContaining({ tools: [] }), {
 			signal: controller.signal,
+			reasoning: "high",
 		});
 		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	it("passes the selected model, auth, and reasoning to the legacy fallback", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "session", id: "model", contextWindow: 200000 } as never;
+		const selected = { provider: "legacy", id: "m", contextWindow: 100000 } as never;
+		vi.mocked(completeSimple).mockResolvedValueOnce(makeCompletionResponse({ text: "legacy answer" }) as never);
+		const controller = new AbortController();
+
+		await executeBtw("question", ctx, controller, { model: selected, reasoning: "medium" });
+
+		expect(completeSimple).toHaveBeenCalledWith(selected, expect.anything(), {
+			apiKey: "test-key",
+			headers: {},
+			signal: controller.signal,
+			reasoning: "medium",
+		});
 	});
 });
 
@@ -381,6 +405,14 @@ describe("buildBtwMessages — history cap engagement", () => {
 		const built = buildBtwMessages(ctx, makeUserMessage("q"), 50);
 		expect(built.droppedTurns).toBe(1);
 		expect(built.keepBudget).toBe(50);
+	});
+
+	it("fits context against the selected model instead of the session model", () => {
+		const ctx = createMockCtx({ branch: buildSessionEntries([makeUserMessage("branch-turn")]) });
+		ctx.model = { provider: "session", id: "large", contextWindow: 200000, maxTokens: 8192 } as never;
+		const selected = { provider: "chosen", id: "small", contextWindow: 10000, maxTokens: 1000 } as never;
+		const built = buildBtwMessages(ctx, makeUserMessage("q"), undefined, selected);
+		expect(built.keepBudget).toBeLessThan(0);
 	});
 });
 
