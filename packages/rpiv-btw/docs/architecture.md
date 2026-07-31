@@ -97,6 +97,11 @@ The request contains the branch snapshot, successful BTW turns, and the new
 question. `btw-budget.ts` preserves the compacted branch summary and fits older
 content without triggering compaction.
 
+CLIProxyAPI Codex Responses calls receive an immutable payload rewrite that sets
+`max_output_tokens: 8192`. This is a `/btw`-appropriate answer ceiling and prevents
+large provider defaults from consuming the whole request limit before prompt tokens
+are considered.
+
 If the first provider response is an error reporting `maximum prompt length is
 500000` or `500,000`, the numeric cap is parsed, reduced by 10%, and used to
 build a temporary model context window targeting that prompt limit. When the error

@@ -37,8 +37,14 @@ compaction.
 ## Context fitting and provider-cap recovery
 
 The budget engine preserves compacted branch summaries and fits the branch plus
-BTW history without changing the main session. If the provider returns an error
-such as:
+BTW history without changing the main session.
+
+CLIProxyAPI Codex Responses calls receive `max_output_tokens: 8192` through the
+public payload hook. Without that explicit cap, the provider may default to the model
+metadata's full output allowance (`grok-4.5`: 500,000 tokens) and count it against
+the same 500,000-token request limit, leaving no room for even a small prompt.
+
+If the provider returns an error such as:
 
 - `maximum prompt length is 500000`
 - `maximum prompt length is 500,000`

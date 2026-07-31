@@ -204,6 +204,51 @@ describe("executeBtw — ok path", () => {
 		expect(completeSimple).not.toHaveBeenCalled();
 	});
 
+	it("caps Codex Responses output tokens so the provider leaves room for the prompt", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "session", id: "model", contextWindow: 200000 } as never;
+		const selected = {
+			provider: "cliproxyapi",
+			id: "grok-4.5",
+			api: "cliproxyapi-codex-responses",
+			contextWindow: 500000,
+			maxTokens: 500000,
+		} as never;
+		const runtimeCompleteSimple = vi.fn(async (_model, _context, options: any) => {
+			const payload = { model: "grok-4.5", input: [] };
+			const result = await options.onPayload(payload, selected);
+			expect(result).toEqual({ ...payload, max_output_tokens: 8192 });
+			expect(payload).not.toHaveProperty("max_output_tokens");
+			return makeCompletionResponse({ text: "custom answer" });
+		});
+		vi.mocked(getRuntimeCompleteSimple).mockReturnValue(runtimeCompleteSimple as never);
+
+		const result = await executeBtw("question", ctx, new AbortController(), { model: selected, reasoning: "medium" });
+
+		expect(result).toMatchObject({ kind: "success", answer: "custom answer" });
+	});
+
+	it("does not inject cliproxyapi payload fields into Pi's built-in Codex API", async () => {
+		const ctx = createMockCtx();
+		ctx.model = { provider: "session", id: "model", contextWindow: 200000 } as never;
+		const selected = {
+			provider: "openai-codex",
+			id: "gpt-5.6-sol",
+			api: "openai-codex-responses",
+			contextWindow: 272000,
+			maxTokens: 128000,
+		} as never;
+		const runtimeCompleteSimple = vi.fn(async (_model, _context, options: any) => {
+			expect(options).not.toHaveProperty("onPayload");
+			return makeCompletionResponse({ text: "built-in answer" });
+		});
+		vi.mocked(getRuntimeCompleteSimple).mockReturnValue(runtimeCompleteSimple as never);
+
+		const result = await executeBtw("question", ctx, new AbortController(), { model: selected });
+
+		expect(result).toMatchObject({ kind: "success", answer: "built-in answer" });
+	});
+
 	it("passes the selected model, auth, and reasoning to the legacy fallback", async () => {
 		const ctx = createMockCtx();
 		ctx.model = { provider: "session", id: "model", contextWindow: 200000 } as never;

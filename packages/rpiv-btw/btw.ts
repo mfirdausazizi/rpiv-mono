@@ -53,6 +53,21 @@ export const BTW_STATE_KEY = Symbol.for("rpiv-btw");
 // Cross-session pattern hint: how many recent question-strings to inject
 export const CROSS_SESSION_HINT_LIMIT = 10;
 
+// `/btw` answers are short. Codex Responses otherwise omits max_output_tokens,
+// letting providers default to a model's full output allowance (grok-4.5: 500k),
+// which is counted against the same 500k request limit and makes the prompt fail.
+const BTW_MAX_OUTPUT_TOKENS = 8192;
+
+function codexOutputPayloadHook(model: Model<Api>): ((payload: unknown) => unknown) | undefined {
+	if (model.api !== "cliproxyapi-codex-responses") return undefined;
+	const configuredMax = model.maxTokens > 0 ? model.maxTokens : BTW_MAX_OUTPUT_TOKENS;
+	const maxOutputTokens = Math.max(16, Math.min(BTW_MAX_OUTPUT_TOKENS, configuredMax));
+	return (payload) =>
+		payload !== null && typeof payload === "object" && !Array.isArray(payload)
+			? { ...payload, max_output_tokens: maxOutputTokens }
+			: payload;
+}
+
 // Messages (static)
 const MSG_REQUIRES_INTERACTIVE = "/btw requires interactive mode";
 const MSG_NO_MODEL = "/btw requires an active model";
@@ -381,17 +396,23 @@ export async function executeBtw(
 			effectiveModel: Model<Api> = model,
 		): Promise<{ kind: "aborted"; stopReason: StopReason } | { kind: "completed"; response: AssistantMessage }> => {
 			const requestReasoning = reasoning as ThinkingLevel | undefined;
+			const onPayload = codexOutputPayloadHook(effectiveModel);
 			const response = await completeSimple(
 				effectiveModel,
 				{ systemPrompt: built.systemPrompt, messages: built.messages, tools: [] },
 				// Runtime auth must resolve its own key/headers/baseUrl; explicit overrides bypass it.
 				runtimeCompleteSimple
-					? { signal: controller.signal, ...(requestReasoning ? { reasoning: requestReasoning } : {}) }
+					? {
+							signal: controller.signal,
+							...(requestReasoning ? { reasoning: requestReasoning } : {}),
+							...(onPayload ? { onPayload } : {}),
+						}
 					: {
 							apiKey: auth.apiKey,
 							headers: auth.headers,
 							signal: controller.signal, // own AbortController, NOT ctx.signal (Decision 8)
 							...(requestReasoning ? { reasoning: requestReasoning } : {}),
+							...(onPayload ? { onPayload } : {}),
 						},
 			);
 			if (response.stopReason === "aborted") {
